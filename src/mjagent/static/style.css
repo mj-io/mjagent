@@ -1,0 +1,54 @@
+:root {
+  --bg: #f6f7f9; --fg: #1d2129; --muted: #6b7280; --card: #fff; --line: #e5e7eb;
+  --brand: #ff6a00; --brand-fg: #fff; --user: #fff1e6; --agent: #fff; --danger: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #15171a; --fg: #e6e6e6; --muted: #9aa0a6; --card: #1f2226; --line: #30343a;
+          --user: #3a2a1d; --agent: #1f2226; --danger: #ff7b6b; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+       display: flex; flex-direction: column; }
+a { color: var(--brand); text-decoration: none; }
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px;
+          background: var(--card); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 600; color: var(--fg); }
+.tag { font-weight: 400; font-size: 12px; color: var(--muted); margin-left: 6px; }
+.topbar nav { display: flex; gap: 12px; align-items: center; font-size: 14px; min-width: 0; }
+.who { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+main { flex: 1; display: flex; flex-direction: column; min-height: 0; width: 100%; max-width: 880px; margin: 0 auto; padding: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.login { max-width: 460px; margin: 6vh auto 0; width: 100%; }
+h1 { font-size: 20px; margin: 0 0 8px; } h2 { font-size: 15px; margin: 20px 0 8px; }
+.muted { color: var(--muted); font-size: 14px; }
+.buttons { display: flex; flex-direction: column; gap: 10px; margin: 18px 0; }
+.btn { display: inline-flex; justify-content: center; align-items: center; padding: 10px 16px; border-radius: 8px; border: 1px solid var(--line);
+       background: var(--card); color: var(--fg); font-size: 15px; cursor: pointer; }
+.btn.primary { background: var(--brand); border-color: var(--brand); color: var(--brand-fg); }
+.btn.small { padding: 6px 12px; font-size: 13px; }
+.btn:disabled { opacity: .5; cursor: default; }
+.alert { white-space: pre-wrap; background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger);
+         border-radius: 8px; padding: 10px 12px; margin: 8px 0; font-size: 14px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; color: var(--muted); margin: 0; }
+.kv dd { margin: 0; word-break: break-all; }
+.chat { flex: 1; display: flex; flex-direction: column; min-height: 0; gap: 10px; }
+.toolbar { display: flex; gap: 8px; }
+.toolbar select { flex: 1; min-width: 0; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+.log { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 4px 0; min-height: 200px; }
+.msg { max-width: 85%; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line); }
+.msg.user { align-self: flex-end; background: var(--user); }
+.msg.agent { align-self: flex-start; background: var(--agent); }
+.msg.failed { border-color: var(--danger); }
+.msg .body { white-space: pre-wrap; word-break: break-word; }
+.msg .body:empty { display: none; }
+.msg .status { font-size: 12px; color: var(--muted); }
+.msg .status:empty { display: none; }
+.msg details { margin-top: 6px; font-size: 12px; }
+pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 12px; }
+.composer { display: flex; gap: 8px; padding-bottom: env(safe-area-inset-bottom); }
+.composer textarea { flex: 1; resize: none; padding: 10px; border-radius: 8px; border: 1px solid var(--line); font: inherit;
+                     background: var(--card); color: var(--fg); min-height: 44px; max-height: 160px; }
+.events { width: 100%; border-collapse: collapse; font-size: 12px; }
+.events td, .events th { border-bottom: 1px solid var(--line); padding: 6px; text-align: left; vertical-align: top; }
+.events code { word-break: break-all; }

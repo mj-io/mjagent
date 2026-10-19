@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}调试 · MJ Agent{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>令牌与调用记录</h1>
+  <p class="muted">只解码不验签，仅用于联调排查。生产环境请设置 DEBUG_PAGE=false。</p>
+  {% for name, claims in tokens.items() %}
+  <h2>{{ name }}</h2>
+  <pre>{{ claims | tojson(indent=2) }}</pre>
+  {% endfor %}
+  <h2>事件</h2>
+  <table class="events">
+    <thead><tr><th>时间</th><th>类型</th><th>详情</th></tr></thead>
+    <tbody>
+    {% for e in events %}
+      <tr><td>{{ e.at }}</td><td>{{ e.kind }}</td><td><code>{{ e | tojson }}</code></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card login">
+  <h1>登录</h1>
+  <p class="muted">用客户自己的身份系统登录。登录后本应用在服务端向 Scutum 交换 Veeva CRM 的访问令牌，再调用 Lyra agent。</p>
+  {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+  <div class="buttons">
+    {% if cfg.pingone_enabled %}
+    <a class="btn primary" href="{{ url_for('pingone_login') }}">使用 PingOne 登录</a>
+    {% endif %}
+    {% if cfg.wecom_enabled %}
+    <a class="btn" href="{{ url_for('wecom_login') }}">使用企业微信登录</a>
+    {% endif %}
+    {% if not cfg.pingone_enabled and not cfg.wecom_enabled %}
+    <div class="alert">未配置任何登录方式：请在 .env 中配置 PINGONE_* 或 WECOM_*，以及对应的 SCUTUM_*_CLIENT_ID。</div>
+    {% endif %}
+  </div>
+  <dl class="kv">
+    <dt>Scutum</dt><dd>{{ cfg.scutum_issuer or '未配置' }}</dd>
+    <dt>Lyra A2A</dt><dd>{{ cfg.lyra_resource or '未配置' }}</dd>
+  </dl>
+</section>
+{% endblock %}

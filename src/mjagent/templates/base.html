@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{% block title %}MJ Agent{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('index') }}">MJ Agent <span class="tag">客户 agent 应用 demo</span></a>
+    {% if user %}
+    <nav>
+      <span class="who" title="{{ user.idp }}:{{ user.subject }}">{{ user.display_name }} · {{ 'PingOne' if user.idp == 'pingone' else '企业微信' }}</span>
+      {% if cfg.debug_page %}<a href="{{ url_for('debug') }}">调试</a>{% endif %}
+      <a href="{{ url_for('logout') }}">退出</a>
+    </nav>
+    {% endif %}
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

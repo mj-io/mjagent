@@ -1,0 +1,192 @@
+"""端到端（全 mock）：PingOne / 企业微信登录 → Scutum Token Exchange → Lyra A2A。"""
+
+import json
+import time
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+import jwt
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.algorithms import RSAAlgorithm
+
+from mjagent import wecom
+from mjagent.app import create_app
+from mjagent.config import Config
+from mjagent.scutum_client import TT_ACCESS_TOKEN, TT_WECOM_CODE, ScutumClient, ScutumError
+
+ISS = "https://auth.pingone.test/env-1/as"
+SCUTUM = "https://scutum.test"
+LYRA = "https://lyra.test/lyra"
+RESOURCE = "https://lyra.test/lyra/a2a"
+KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+JWK = {**json.loads(RSAAlgorithm.to_jwk(KEY.public_key())), "kid": "k1", "alg": "RS256", "use": "sig"}
+
+CFG = Config(
+    secret_key="test", app_base_url="https://mjagent.test", debug_page=True,
+    pingone_issuer=ISS, pingone_client_id="p1-app", pingone_client_secret="p1-secret",
+    pingone_scopes="openid profile email a2a.invoke", pingone_subject_token="access_token",
+    wecom_corp_id="ww-corp", wecom_agent_id="1000002",
+    scutum_issuer=SCUTUM, scutum_pingone_client_id="agt-p", scutum_pingone_client_secret="sp",
+    scutum_wecom_client_id="agt-w", scutum_wecom_client_secret="sw",
+    lyra_base_url=LYRA, lyra_resource=RESOURCE,
+)
+
+
+class World:
+    """一组外部服务的 mock 与调用记录。"""
+
+    def __init__(self):
+        self.calls: list[httpx.Request] = []
+        self.nonce = ""
+        self.scutum_ttl = 900
+        self.scutum_error: dict | None = None
+
+    def handler(self, req: httpx.Request) -> httpx.Response:
+        self.calls.append(req)
+        url = str(req.url)
+        if url == f"{ISS}/.well-known/openid-configuration":
+            return httpx.Response(200, json={"issuer": ISS, "authorization_endpoint": f"{ISS}/authorize",
+                                             "token_endpoint": f"{ISS}/token", "jwks_uri": f"{ISS}/jwks"})
+        if url == f"{ISS}/token":
+            now = int(time.time())
+            id_token = jwt.encode({"iss": ISS, "aud": "p1-app", "sub": "p1-alice", "email": "alice@contoso.com",
+                                   "name": "Alice", "nonce": self.nonce, "iat": now, "exp": now + 3600},
+                                  KEY, algorithm="RS256", headers={"kid": "k1"})
+            return httpx.Response(200, json={"access_token": "pingone-at-for-scutum", "id_token": id_token,
+                                             "expires_in": 3600, "scope": "openid profile email a2a.invoke"})
+        if url == f"{SCUTUM}/oauth/token":
+            if self.scutum_error:
+                return httpx.Response(400, json=self.scutum_error)
+            form = parse_qs(req.content.decode())
+            body = {"access_token": f"lyra-token-for-{form['subject_token'][0]}", "token_type": "Bearer",
+                    "issued_token_type": TT_ACCESS_TOKEN, "expires_in": self.scutum_ttl, "scope": "a2a:invoke"}
+            if form["subject_token_type"][0] == TT_WECOM_CODE:
+                body["idp_subject"] = "zhangsan"
+            return httpx.Response(200, json=body)
+        if url == f"{LYRA}/a2a/agents":
+            if not req.headers.get("authorization", "").startswith("Bearer lyra-token-for-"):
+                return httpx.Response(401, json={"detail": "Unauthorized"}, headers={"WWW-Authenticate": 'Bearer realm="lyra-a2a"'})
+            return httpx.Response(200, json={"agents": [{"key": "crm_bot", "name": "CRM Bot"}]})
+        if url == f"{LYRA}/a2a/crm_bot/jsonrpc":
+            ev1 = {"jsonrpc": "2.0", "id": "1", "result": {"statusUpdate": {"contextId": "ctx-9", "status": {"state": "TASK_STATE_WORKING"}}}}
+            ev2 = {"jsonrpc": "2.0", "id": "1", "result": {"statusUpdate": {"contextId": "ctx-9", "status": {
+                "state": "TASK_STATE_COMPLETED", "message": {"parts": [{"text": "你好"}]}}}}}
+            sse = "".join(f"data: {json.dumps(e)}\n\n" for e in (ev1, ev2))
+            return httpx.Response(200, content=sse.encode(), headers={"content-type": "text/event-stream"})
+        return httpx.Response(404, json={"detail": f"unmocked {url}"})
+
+
+@pytest.fixture
+def world(monkeypatch):
+    w = World()
+    real_client = httpx.Client
+
+    class MockedClient(real_client):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(w.handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", MockedClient)
+    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda self: {"keys": [JWK]})
+    from mjagent import pingone
+    pingone._discovery_cache.clear()
+    return w
+
+
+@pytest.fixture
+def client(world):
+    app = create_app(CFG)
+    app.testing = True
+    return app.test_client()
+
+
+def _pingone_login(client, world):
+    r = client.get("/auth/pingone/login")
+    assert r.status_code == 302
+    q = parse_qs(urlparse(r.headers["Location"]).query)
+    assert q["scope"] == ["openid profile email a2a.invoke"] and q["code_challenge_method"] == ["S256"]
+    world.nonce = q["nonce"][0]
+    return client.get(f"/auth/pingone/callback?code=c1&state={q['state'][0]}")
+
+
+def test_pingone_login_exchange_and_chat(client, world):
+    r = _pingone_login(client, world)
+    assert r.status_code == 302 and r.headers["Location"].endswith("/chat")
+    ex = next(c for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token")
+    form = parse_qs(ex.content.decode())
+    assert form["grant_type"] == ["urn:ietf:params:oauth:grant-type:token-exchange"]
+    assert form["subject_token"] == ["pingone-at-for-scutum"] and form["subject_token_type"] == [TT_ACCESS_TOKEN]
+    assert form["resource"] == [RESOURCE] and form["scope"] == ["a2a:invoke"]
+    assert ex.headers["authorization"].startswith("Basic ")
+
+    r = client.get("/api/agents")
+    assert r.status_code == 200 and r.json["agents"][0]["key"] == "crm_bot"
+
+    r = client.post("/api/chat", json={"agent": "crm_bot", "text": "hi"})
+    body = r.get_data(as_text=True)
+    assert r.mimetype == "text/event-stream" and "你好" in body
+    # 第二轮带回 contextId
+    client.post("/api/chat", json={"agent": "crm_bot", "text": "again"}).get_data()
+    rpc = [c for c in world.calls if str(c.url).endswith("/jsonrpc")]
+    msg2 = json.loads(rpc[-1].content)["params"]["message"]
+    assert msg2["contextId"] == "ctx-9" and rpc[-1].headers["a2a-version"] == "1.0"
+
+    page = client.get("/debug").get_data(as_text=True)
+    assert "token_exchange" in page and "p1-alice" in page
+
+
+def test_pingone_reexchanges_when_lyra_token_expires(client, world):
+    world.scutum_ttl = 10   # 小于 30 秒余量 → 立即视为过期
+    _pingone_login(client, world)
+    n = sum(1 for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token")
+    assert client.get("/api/agents").status_code == 200
+    assert sum(1 for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token") == n + 1
+
+
+def test_pingone_exchange_failure_still_logs_in(client, world):
+    world.scutum_error = {"error": "invalid_grant", "error_description": "subject could not be mapped"}
+    r = _pingone_login(client, world)
+    assert r.headers["Location"].endswith("/chat")
+    r = client.get("/api/agents")
+    assert r.status_code == 401 and r.json["error"] == "login_required"
+
+
+def test_wecom_login_hands_code_to_scutum(client, world):
+    r = client.get("/auth/wecom/login", headers={"User-Agent": "Mozilla/5.0 wxwork/4.1"})
+    loc = r.headers["Location"]
+    assert loc.startswith(wecom.OAUTH_AUTHORIZE) and "scope=snsapi_base" in loc and loc.endswith("#wechat_redirect")
+    state = parse_qs(urlparse(loc.split("#")[0]).query)["state"][0]
+    r = client.get(f"/auth/wecom/callback?code=wx-code-1&state={state}")
+    assert r.headers["Location"].endswith("/chat")
+    form = parse_qs(next(c for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token").content.decode())
+    assert form["subject_token"] == ["wx-code-1"] and form["subject_token_type"] == [TT_WECOM_CODE]
+    assert "zhangsan" in client.get("/chat").get_data(as_text=True)
+    # 本应用没有直接调企微 API
+    assert not any("qyapi.weixin.qq.com" in str(c.url) for c in world.calls)
+
+
+def test_wecom_token_expiry_requires_silent_reauth(client, world):
+    world.scutum_ttl = 10
+    r = client.get("/auth/wecom/login")
+    assert r.headers["Location"].startswith(wecom.QR_LOGIN)   # 普通浏览器 → 扫码
+    state = parse_qs(urlparse(r.headers["Location"]).query)["state"][0]
+    client.get(f"/auth/wecom/callback?code=wx-code-2&state={state}")
+    r = client.get("/api/agents")
+    assert r.status_code == 401 and r.json["login_url"] == "/auth/wecom/login"
+
+
+def test_wecom_callback_rejects_bad_state(client, world):
+    client.get("/auth/wecom/login")
+    r = client.get("/auth/wecom/callback?code=x&state=forged")
+    assert "error=" in r.headers["Location"]
+    assert not any(str(c.url) == f"{SCUTUM}/oauth/token" for c in world.calls)
+
+
+def test_scutum_client_error_mapping():
+    def handler(req):
+        return httpx.Response(400, json={"error": "invalid_grant", "error_description": "nope"})
+    c = ScutumClient(SCUTUM, "agt-x", "s", resource=RESOURCE, transport=httpx.MockTransport(handler))
+    with pytest.raises(ScutumError) as ei:
+        c.exchange_wecom_code("code")
+    assert ei.value.error == "invalid_grant" and ei.value.status == 400

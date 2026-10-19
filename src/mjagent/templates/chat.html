@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}对话 · MJ Agent{% endblock %}
+{% block content %}
+<section class="chat">
+  <div class="toolbar">
+    <select id="agent" aria-label="选择 agent"><option>加载中…</option></select>
+    <button id="new" class="btn small" type="button">新对话</button>
+  </div>
+  <div id="notice" class="alert" hidden></div>
+  <div id="log" class="log" aria-live="polite"></div>
+  <form id="composer" class="composer" autocomplete="off">
+    <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" required></textarea>
+    <button class="btn primary" type="submit" id="send">发送</button>
+  </form>
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='chat.js') }}"></script>{% endblock %}
