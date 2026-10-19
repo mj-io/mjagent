@@ -148,8 +148,16 @@ def test_pingone_exchange_failure_still_logs_in(client, world):
     world.scutum_error = {"error": "invalid_grant", "error_description": "subject could not be mapped"}
     r = _pingone_login(client, world)
     assert r.headers["Location"].endswith("/chat")
+    # 登录态仍有效：不能再把用户送回登录页（会无限跳转），而是直接报交换失败原因
     r = client.get("/api/agents")
-    assert r.status_code == 401 and r.json["error"] == "login_required"
+    assert r.status_code == 502 and r.json["error"] == "token_exchange_failed" and "subject could not be mapped" in r.json["message"]
+
+
+def test_scutum_non_oauth_error_keeps_reason(client, world):
+    world.scutum_error = {"detail": "Not Found"}
+    _pingone_login(client, world)
+    r = client.get("/api/agents")
+    assert r.status_code == 502 and "HTTP 400" in r.json["message"] and "Not Found" in r.json["message"]
 
 
 def test_wecom_login_hands_code_to_scutum(client, world):

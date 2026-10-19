@@ -38,7 +38,7 @@
 | Applications → **Resources** → `+` | 新建 Custom Resource，**Audience** 填 Scutum 的标识（如 `https://scutum-auth-login.crmdev.veevasfa.com`，即 Scutum 侧 `exchange_audience`） |
 | 该 Resource → **Scopes** | 新增 `a2a.invoke` |
 | 该 Resource → **Attributes** | 新增 `email` → Email Address（Scutum 按 email 匹配 CRM 用户） |
-| Applications → mjagent（OIDC Web App） | Resources 勾选 `a2a.invoke`；Redirect URI 登记 `{APP_BASE_URL}/auth/pingone/callback`；Token Auth Method = Client Secret Basic；PKCE 可选 S256 |
+| Applications → mjagent（OIDC Web App） | **Resources** 勾选 openid 的 `profile`、`email` 和 Custom Resource 的 `a2a.invoke`（PingOne 会静默丢弃未授权的 scope，登录照样成功，用 `/debug` 的「PingOne 配置自检」确认）；Redirect URI 登记 `{APP_BASE_URL}/auth/pingone/callback`；Token Auth Method = Client Secret Basic；PKCE 可选 S256 |
 
 ### 2. 企业微信（客户管理员在企微管理后台，自建应用）
 
@@ -57,7 +57,9 @@ LYRA_RESOURCE=https://wchat-auth-login.crmdev.veevasfa.com/lyra/a2a
 curl -sX POST $S/admin/idps -H "$H" -H 'Content-Type: application/json' -d '{
   "name":"pingone","type":"pingone","tenant_id":"<PingOne Environment ID>","client_id":"-","identity_claim":"email",
   "exchange_enabled":true,"exchange_audience":"https://scutum-auth-login.crmdev.veevasfa.com","exchange_required_scopes":["a2a.invoke"]}'
-# 非 .com 区域另加 "discovery_url":"https://auth.pingone.asia/<env>/as/.well-known/openid-configuration"
+# ⚠️ 区域必须与应用所在区域一致（应用 Overview → Connection Details → Issuer ID）。非 .com 区域（.sg / .eu / .asia / .ca）
+#    必须显式填 "discovery_url":"https://auth.pingone.sg/<env>/as/.well-known/openid-configuration"：
+#    auth.pingone.com 对其它区域的环境也会返回 discovery，但 issuer 是 .com，与 token 的 iss 对不上，交换会失败
 
 # mjagent 的 PingOne 交换 client → 记下返回的 client_id / client_secret（secret 只返回这一次）
 curl -sX POST $S/admin/clients -H "$H" -H 'Content-Type: application/json' -d '{

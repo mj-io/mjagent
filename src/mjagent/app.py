@@ -43,6 +43,15 @@ class LoginRequired(Exception):
         self.reason = reason
 
 
+class ExchangeFailed(Exception):
+    """登录态有效但 Scutum 拒绝交换：重新登录解决不了（会无限跳转），直接把原因交给前端。"""
+
+    def __init__(self, err: ScutumError):
+        super().__init__(str(err))
+        self.error = err.error
+        self.description = err.description
+
+
 def _claims(token: str | None) -> dict:
     """只解码不验签，用于调试页展示。"""
     if not token:
@@ -93,7 +102,8 @@ def create_app(cfg: Config | None = None) -> Flask:
                 return sess.scutum.access_token
             except ScutumError as e:
                 sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
-        # 企微 code 一次性，只能再走一次（企微内静默的）授权；PingOne 有 SSO 会话时同样无感
+                raise ExchangeFailed(e) from e
+        # PingOne token 也过期了 / 企微 code 一次性：只能再走一次登录（企微内静默；PingOne 有 SSO 会话时同样无感）
         raise LoginRequired(login_url_for(sess.idp), "lyra token expired")
 
     # ------------------------------------------------------------------ pages
@@ -126,6 +136,7 @@ def create_app(cfg: Config | None = None) -> Flask:
             "Scutum access_token（签给 Lyra）": _claims(sess.scutum.access_token if sess.scutum else None),
         }
         return render_template("debug.html", cfg=cfg, user=sess, tokens={k: v for k, v in tokens.items() if v},
+                               checks=_pingone_checks(sess) if sess.idp == "pingone" else [],
                                events=list(reversed(sess.events)))
 
     @app.get("/logout")
@@ -220,6 +231,8 @@ def create_app(cfg: Config | None = None) -> Flask:
     def _api_error(e: Exception):
         if isinstance(e, LoginRequired):
             return jsonify(error="login_required", reason=e.reason, login_url=e.login_url), 401
+        if isinstance(e, ExchangeFailed):
+            return jsonify(error="token_exchange_failed", message=f"Scutum 拒绝交换：{e.error} {e.description}".strip()), 502
         if isinstance(e, A2AError):
             return jsonify(error="lyra_error", status=e.status, message=e.message,
                            www_authenticate=e.www_authenticate), 502 if e.status >= 500 else e.status
@@ -235,7 +248,7 @@ def create_app(cfg: Config | None = None) -> Flask:
             return jsonify(error="login_required", login_url=url_for("index")), 401
         try:
             agents = _client(sess).list_agents()
-        except (LoginRequired, A2AError) as e:
+        except (LoginRequired, ExchangeFailed, A2AError) as e:
             sess.log("a2a", call="list_agents", result=type(e).__name__, detail=str(e))
             return _api_error(e)
         return jsonify(agents=agents)
@@ -247,7 +260,7 @@ def create_app(cfg: Config | None = None) -> Flask:
             return jsonify(error="login_required", login_url=url_for("index")), 401
         try:
             return jsonify(_client(sess).agent_card(agent))
-        except (LoginRequired, A2AError) as e:
+        except (LoginRequired, ExchangeFailed, A2AError) as e:
             return _api_error(e)
 
     @app.post("/api/chat")
@@ -263,7 +276,7 @@ def create_app(cfg: Config | None = None) -> Flask:
             sess.context_ids.pop(agent, None)
         try:
             client = _client(sess)
-        except LoginRequired as e:
+        except (LoginRequired, ExchangeFailed) as e:
             return _api_error(e)
 
         def events() -> Iterator[str]:
@@ -285,6 +298,22 @@ def create_app(cfg: Config | None = None) -> Flask:
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     return app
+
+
+def _pingone_checks(sess: UserSession) -> list[tuple[bool, str]]:
+    """PingOne 侧配置自检：PingOne 会静默丢掉应用未授权的 scope，只看登录成功看不出问题。"""
+    at, idt = _claims(sess.pingone_access_token), sess.id_token_claims
+    scopes = set(str(at.get("scope", "")).split())
+    auds = at.get("aud") if isinstance(at.get("aud"), list) else [at.get("aud")]
+    platform = any(isinstance(a, str) and a.startswith("https://api.pingone.") for a in auds)
+    return [
+        ("a2a.invoke" in scopes, f"access_token scope 含 a2a.invoke（实际：{' '.join(sorted(scopes)) or '无'}）"
+                                 "——否则在应用 Resources 标签勾选 Custom Resource 的 a2a.invoke"),
+        (not platform, f"access_token aud 是 Scutum 而非 PingOne 平台（实际：{auds}）"
+                       "——aud 为 api.pingone.* 说明没拿到 Custom Resource 的 token"),
+        (bool(at.get("email")), "access_token 带 email（Scutum 按它匹配 CRM 用户）——否则在 Custom Resource 的 Attributes 映射 email"),
+        (bool(idt.get("email")), "id_token 带 email——否则在应用 Resources 勾选 openid 的 email、profile"),
+    ]
 
 
 def _context_id(msg: dict) -> str | None:

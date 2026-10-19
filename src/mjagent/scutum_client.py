@@ -82,7 +82,9 @@ class ScutumClient:
         except ValueError:
             raise ScutumError("server_error", f"HTTP {resp.status_code}: {resp.text[:200]}", resp.status_code) from None
         if resp.status_code != 200:
-            raise ScutumError(body.get("error", "server_error"), body.get("error_description", ""), resp.status_code)
+            # 非 RFC 6749 错误体（如 Scutum 未部署 /oauth/token 时的 404 {"detail": ...}）也要带上原因
+            desc = body.get("error_description") or f"HTTP {resp.status_code} {self.token_endpoint}: {str(body)[:200]}"
+            raise ScutumError(body.get("error", "server_error"), desc, resp.status_code)
         return ScutumToken(access_token=body["access_token"], expires_at=time.time() + int(body.get("expires_in", 300)),
                            scope=body.get("scope", ""), idp_subject=body.get("idp_subject"))
 

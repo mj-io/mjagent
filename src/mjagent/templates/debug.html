@@ -4,6 +4,12 @@
 <section class="card">
   <h1>令牌与调用记录</h1>
   <p class="muted">只解码不验签，仅用于联调排查。生产环境请设置 DEBUG_PAGE=false。</p>
+  {% if checks %}
+  <h2>PingOne 配置自检</h2>
+  <ul class="checks">
+    {% for ok, text in checks %}<li class="{{ 'ok' if ok else 'bad' }}">{{ '✓' if ok else '✗' }} {{ text }}</li>{% endfor %}
+  </ul>
+  {% endif %}
   {% for name, claims in tokens.items() %}
   <h2>{{ name }}</h2>
   <pre>{{ claims | tojson(indent=2) }}</pre>

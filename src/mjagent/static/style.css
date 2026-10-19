@@ -52,3 +52,6 @@ pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; 
 .events { width: 100%; border-collapse: collapse; font-size: 12px; }
 .events td, .events th { border-bottom: 1px solid var(--line); padding: 6px; text-align: left; vertical-align: top; }
 .events code { word-break: break-all; }
+.checks { list-style: none; padding: 0; margin: 0; font-size: 14px; }
+.checks li { padding: 4px 0; }
+.checks .ok { color: #1a7f37; } .checks .bad { color: var(--danger); }
