@@ -47,7 +47,8 @@ class Config:
 
     @property
     def pingone_enabled(self) -> bool:
-        return bool(self.pingone_issuer and self.pingone_client_id and self.scutum_pingone_client_id)
+        # 不要求 Scutum client：PingOne 登录是客户应用自己的事，交换失败会在调试页 / 对话里提示
+        return bool(self.pingone_issuer and self.pingone_client_id)
 
     @property
     def wecom_enabled(self) -> bool:
