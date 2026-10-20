@@ -3,13 +3,19 @@
 为什么不在 iframe 内直接跳 IdP：IdP 登录页带 frame-ancestors 'none'（拒绝被嵌入）；iframe 是第三方上下文，
 IdP 会话 cookie 带不上、本应用 cookie 被分区或拦截。弹窗是顶层窗口：IdP 页面正常渲染、cookie 是第一方、SSO 通常一闪而过。
 
-流程（弹窗 + postMessage，轮询兜底）：
+流程 A（弹窗 + postMessage，轮询兜底）：
   iframe  POST /embed/auth/begin {binding}      → flow_id；同时下发 Partitioned cookie embed_flow（仅作观测）
           window.open → /embed/auth/start?flow_id   （window.open 必须在点击里同步调用，先开 about:blank）
   弹窗    → PingOne /authorize（redirect_uri = 本域 /embed/auth/callback）→ 回调：服务端换 token、建会话
           → 回调页 window.opener.postMessage({type, code}, 本源) ；code 为一次性 handoff code（60 秒，单次）
   iframe  POST /embed/auth/finish {code, binding} → 会话 cookie（SameSite=None; Secure; Partitioned）+ 内存 session_token
           COOP 切断 opener 时 postMessage 收不到：iframe 轮询 /embed/auth/status，完成后用 {flow_id, binding} finish
+
+流程 B（顶层跳转兜底：弹窗不可用，如 iOS 企业微信 WKWebView 里 window.open 返回 null）：
+  iframe 加载时预先算好 binding 的 SHA-256，点击时**同步**把顶层窗口导航到
+          /embed/auth/top?bh=<sha256(binding)>&return=<宿主页 URL>（WebKit 要求在用户手势的同步调用栈里改顶层地址）
+  顶层    → PingOne → 回调建会话 → 302 回宿主页（return 只能是登记过的宿主源，防开放重定向）
+  iframe  重新加载，从 sessionStorage 取回 binding，轮询 /embed/auth/status → finish {flow_id, binding}
 
 防登录 CSRF / 会话固定：finish 必须带上发起 begin 的那个 iframe 的 binding（iframe 内存里的随机值，只提交其 SHA-256），
 攻击者拿到自己账号的 handoff code 也塞不进受害者的 iframe。binding 不依赖 cookie，Safari 等彻底拦截第三方 cookie 时同样成立；
@@ -53,6 +59,8 @@ class Flow:
     sid: str | None = None
     error: str | None = None
     user: dict = field(default_factory=dict)
+    # 顶层跳转模式（弹窗不可用，如 iOS 企业微信 WKWebView）：登录完成后 302 回到宿主页
+    return_url: str | None = None
 
 
 class EmbedFlows:
@@ -81,6 +89,21 @@ class EmbedFlows:
             flow_id = secrets.token_urlsafe(24)
             self.flows[flow_id] = Flow(binding_hash=_h(binding))
             return flow_id
+
+    def begin_with_hash(self, binding_hash: str, return_url: str) -> str:
+        """顶层跳转模式：flow 在顶层请求里创建，只收 binding 的 SHA-256（binding 本身留在 iframe 的 sessionStorage）。"""
+        with self._lock:
+            self._gc()
+            flow_id = secrets.token_urlsafe(24)
+            self.flows[flow_id] = Flow(binding_hash=binding_hash, return_url=return_url)
+            return flow_id
+
+    def find_by_binding(self, binding: str | None) -> tuple[str, Flow] | None:
+        """跳回宿主页后 iframe 只有 binding（flow_id 是顶层请求里才生成的）：按 binding 找最近的 flow。"""
+        h = _h(binding or "")
+        with self._lock:
+            hits = [(fid, f) for fid, f in self.flows.items() if hmac.compare_digest(f.binding_hash, h)]
+            return max(hits, key=lambda x: x[1].created) if hits else None
 
     def get(self, flow_id: str | None) -> Flow | None:
         with self._lock:

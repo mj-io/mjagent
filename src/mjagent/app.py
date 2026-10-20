@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Iterator
+from urllib.parse import urlencode, urlsplit
 
 import jwt
 from flask import (
@@ -188,7 +190,11 @@ def create_app(cfg: Config | None = None) -> Flask:
     def embed_host():
         if not cfg.embed_app_url:
             abort(404)
-        resp = Response(render_template("embed_host.html", cfg=cfg, user=None, app_origin=origin_of(cfg.embed_app_url)))
+        # 把宿主页自身地址交给 iframe：弹窗不可用时 iframe 顶层跳转去登录，完成后据此跳回（iframe 跨域读不到宿主 URL）
+        host_url = f"{cfg.app_base_url}{request.full_path.rstrip('?')}"
+        iframe_src = f"{cfg.embed_app_url}?{urlencode({'host_url': host_url})}"
+        resp = Response(render_template("embed_host.html", cfg=cfg, user=None, app_origin=origin_of(cfg.embed_app_url),
+                                        iframe_src=iframe_src))
         # CSP frame-src 只放行登记过的嵌入应用
         resp.headers["Content-Security-Policy"] = f"frame-src {origin_of(cfg.embed_app_url)}"
         return resp
@@ -220,6 +226,26 @@ def create_app(cfg: Config | None = None) -> Flask:
         resp.set_cookie(FLOW_COOKIE, flow_id, max_age=600, path="/embed", secure=True, httponly=True,
                         samesite="None", partitioned=True)
         return resp
+
+    def _allowed_return(url: str | None) -> str | None:
+        """顶层跳转回宿主页的地址：必须是 https 且源在 EMBED_FRAME_ANCESTORS 里（防开放重定向）。"""
+        if not url:
+            return None
+        p = urlsplit(url)
+        allowed = set(cfg.embed_frame_ancestors.split())
+        return url if p.scheme == "https" and f"{p.scheme}://{p.netloc}" in allowed else None
+
+    @app.get("/embed/auth/top")
+    def embed_top():
+        """顶层跳转模式入口（iframe 用 window.top 导航过来，此时已是顶层窗口）：建 flow 并送去 PingOne。"""
+        _embed_only()
+        bh, ret = request.args.get("bh") or "", _allowed_return(request.args.get("return"))
+        origin = origin_of(cfg.app_base_url)
+        if not re.fullmatch(r"[0-9a-f]{64}", bh) or not ret:
+            return render_template("embed_callback.html", cfg=cfg, user=None, code=None, origin=origin,
+                                   error="参数无效：bh 须为 binding 的 SHA-256，return 须为登记过的宿主页地址"), 400
+        flow_id = flows.begin_with_hash(bh, ret)
+        return redirect(url_for("embed_start", flow_id=flow_id))
 
     @app.get("/embed/auth/start")
     def embed_start():
@@ -257,16 +283,25 @@ def create_app(cfg: Config | None = None) -> Flask:
         sess.log("embed", step="popup_callback", flow=flow_id[:8])
         f.sid, f.status = store.put(sess), "done"
         f.user = {"name": sess.display_name, "email": sess.email}
+        if f.return_url:
+            # 顶层跳转模式：回到宿主页，iframe 重新加载后凭 sessionStorage 里的 binding 完成登录（URL 里不带任何 code）
+            return redirect(f.return_url)
         return render_template("embed_callback.html", cfg=cfg, user=None, code=flows.issue_handoff(flow_id), origin=origin, error=None)
 
     @app.get("/embed/auth/status")
     def embed_status():
         """轮询兜底（opener 被 COOP 切断时 postMessage 收不到）：只对持有 binding 的 iframe 回答。"""
         _embed_only()
-        f = flows.get(request.args.get("flow_id"))
-        if f is None or not flows.binding_ok(f, request.headers.get("X-Embed-Binding")):
+        binding = request.headers.get("X-Embed-Binding")
+        flow_id = request.args.get("flow_id")
+        if flow_id:
+            f = flows.get(flow_id)
+        else:                                     # 顶层跳转模式：iframe 只有 binding
+            hit = flows.find_by_binding(binding)
+            flow_id, f = hit if hit else (None, None)
+        if f is None or not flows.binding_ok(f, binding):
             return jsonify(status="unknown"), 404
-        return jsonify(status=f.status, error=f.error)
+        return jsonify(status=f.status, error=f.error, flow_id=flow_id)
 
     @app.post("/embed/auth/finish")
     def embed_finish():

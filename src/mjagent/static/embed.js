@@ -4,7 +4,16 @@
   const $ = (id) => document.getElementById(id);
   const cfg = $("embed-cfg").dataset;
   const ORIGIN = cfg.origin;
-  let sessionToken = null;
+  const HOST_URL = new URLSearchParams(location.search).get("host_url") || "";
+  const K_TOKEN = "mjagent_embed_token", K_PENDING = "mjagent_embed_pending";
+  // sessionStorage 在第三方 iframe 里按顶层站点分区、按标签页隔离：顶层跳走再回来仍在（WebKit / 企业微信 iOS 也可用）
+  const ss = {
+    get(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { sessionStorage.setItem(k, v); return true; } catch (e) { return false; } },
+    del(k) { try { sessionStorage.removeItem(k); } catch (e) { /* ignore */ } },
+  };
+  let sessionToken = ss.get(K_TOKEN);
+  let topNav = null;   // {binding, url}：弹窗不可用时的顶层跳转地址，加载时预先算好（点击时必须同步跳转）
 
   function step(text, cls) {
     const li = document.createElement("li");
@@ -75,11 +84,56 @@
     return r;
   }
 
-  // ---------------------------------------------------------------- 登录：弹窗 + postMessage + 轮询兜底
+  async function sha256hex(text) {
+    const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function prepareTopNav() {
+    if (!HOST_URL) return;
+    const binding = randomHex(32);
+    const bh = await sha256hex(binding);
+    topNav = { binding, url: `${ORIGIN}/embed/auth/top?bh=${bh}&return=${encodeURIComponent(HOST_URL)}` };
+  }
+
+  function goTop() {
+    // 流程 B：弹窗不可用（iOS 企业微信 WKWebView 的 window.open 返回 null）→ 在同一个点击的同步调用栈里导航顶层窗口
+    if (!topNav) { step("无法顶层跳转：宿主页未传 host_url", "bad"); return; }
+    if (!ss.set(K_PENDING, topNav.binding)) { step("sessionStorage 不可用，跳回后无法完成登录", "bad"); return; }
+    step("弹窗不可用，改为顶层跳转登录（完成后回到本页）", "warn");
+    try {
+      window.top.location.href = topNav.url;
+    } catch (e) {
+      // sandbox 缺 allow-top-navigation-by-user-activation，或浏览器不认这次点击：给一个原生 target=_top 链接再点一次
+      step("顶层跳转被拒绝：" + e.message + "；请点下方链接", "bad");
+      const a = document.createElement("a");
+      a.href = topNav.url; a.target = "_top"; a.textContent = "前往登录"; a.className = "btn small primary";
+      $("steps").appendChild(a);
+    }
+  }
+
+  async function resumeTopNav() {
+    // 从顶层跳转回来：iframe 重新加载，凭 sessionStorage 里的 binding 向服务端确认登录结果
+    const binding = ss.get(K_PENDING);
+    if (!binding) return false;
+    step("检测到未完成的顶层跳转登录，正在确认…");
+    for (let i = 0; i < 5; i++) {
+      const s = await fetch("/embed/auth/status", { headers: { "X-Embed-Binding": binding } }).then((x) => x.json()).catch(() => ({}));
+      if (s.status === "done") { ss.del(K_PENDING); await finish({ flow_id: s.flow_id }, binding); return true; }
+      if (s.status === "error") { ss.del(K_PENDING); step("登录失败：" + (s.error || ""), "bad"); return false; }
+      if (s.status === "unknown") break;
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    ss.del(K_PENDING);
+    step("没有找到已完成的登录（可能已取消或超时），请重新登录", "warn");
+    return false;
+  }
+
+  // ---------------------------------------------------------------- 登录：A 弹窗 + postMessage（轮询兜底）/ B 顶层跳转
   $("login").addEventListener("click", async () => {
     // 必须在点击回调里**同步**打开弹窗（先 about:blank），await 之后再开会被浏览器拦截
     const popup = window.open("about:blank", "mjagent-login", "width=480,height=680");
-    if (!popup) { step("弹窗被浏览器拦截：请允许本站弹窗后重试", "bad"); return; }
+    if (!popup) { goTop(); return; }
     step("已在点击中同步打开顶层弹窗");
     const binding = randomHex(32);          // 只在本 iframe 内存里；服务端只存其 SHA-256
     let r;
@@ -119,6 +173,7 @@
     const body = await r.json().catch(() => ({}));
     if (!r.ok) { step(`finish 失败：${body.message || r.status}`, "bad"); return; }
     sessionToken = body.session_token;
+    ss.set(K_TOKEN, sessionToken);   // cookie 被拦截（WebKit）时整页重载后仍能续用；分区存储，宿主外不可见
     step(`finish 成功（${body.via}）；begin 时下发的分区 flow cookie ${body.flow_cookie_seen ? "已带回" : "未带回"}`, "ok");
     await whoami();
   }
@@ -126,6 +181,7 @@
   $("logout").addEventListener("click", async () => {
     await api("/embed/logout", { method: "POST" });
     sessionToken = null;
+    ss.del(K_TOKEN);
     $("log").innerHTML = "";
     step("已退出");
     whoami();
@@ -190,5 +246,10 @@
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); $("composer").requestSubmit(); }
   });
 
-  diagnose().then(whoami);
+  (async () => {
+    await diagnose();
+    setEnv("宿主页地址（host_url）", HOST_URL || "未传入");
+    prepareTopNav().catch((e) => step("准备顶层跳转失败：" + e.message, "bad"));
+    if (!(await resumeTopNav())) await whoami();
+  })();
 })();

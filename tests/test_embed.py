@@ -109,6 +109,40 @@ def test_host_page_iframe_attributes(world):  # noqa: F811
     r = app.test_client().get("/embed-host")
     html = r.get_data(as_text=True)
     assert r.headers["Content-Security-Policy"] == "frame-src https://embed.test"
-    assert 'src="https://embed.test/embed/app"' in html
-    assert 'sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"' in html
-    assert "allow-top-navigation" not in html
+    assert 'src="https://embed.test/embed/app?host_url=https%3A%2F%2Fmjagent.test%2Fembed-host"' in html
+    # 弹窗不可用（iOS 企业微信）时的兜底只放开「用户点击触发」的顶层跳转，不给无手势的 allow-top-navigation
+    assert ('sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox '
+            'allow-top-navigation-by-user-activation"') in html
+    assert "allow-top-navigation " not in html and 'allow-top-navigation"' not in html
+
+
+def _sha(v):
+    import hashlib
+    return hashlib.sha256(v.encode()).hexdigest()
+
+
+def test_top_navigation_fallback(embed, world):  # noqa: F811
+    """iOS 企业微信：window.open 返回 null → iframe 顶层跳转 /embed/auth/top，登录后 302 回宿主页，iframe 凭 binding 完成。"""
+    top = embed.test_client()                                     # 顶层窗口（与 iframe 不同的 cookie 分区）
+    r = top.get(f"/embed/auth/top?bh={_sha(BINDING)}&return=https://host.test/embed-host")
+    assert r.status_code == 302 and "/embed/auth/start?flow_id=" in r.headers["Location"]
+    r = top.get(r.headers["Location"])
+    q = parse_qs(urlparse(r.headers["Location"]).query)
+    world.nonce = q["nonce"][0]
+    r = top.get(f"/embed/auth/callback?code=c1&state={q['state'][0]}")
+    assert r.status_code == 302 and r.headers["Location"] == "https://host.test/embed-host"   # URL 里不带 code
+    iframe = embed.test_client()                                  # 宿主页重新加载后的 iframe：只有 sessionStorage 里的 binding
+    assert iframe.get("/embed/auth/status", headers={"X-Embed-Binding": "x" * 64}).status_code == 404
+    st = iframe.get("/embed/auth/status", headers={"X-Embed-Binding": BINDING}).json
+    assert st["status"] == "done" and st["flow_id"]
+    r = iframe.post("/embed/auth/finish", json={"flow_id": st["flow_id"], "binding": BINDING})
+    assert r.status_code == 200 and r.json["user"]["email"] == "alice@contoso.com"
+
+
+@pytest.mark.parametrize("query", [
+    f"bh={'0' * 64}&return=https://evil.test/x",          # 未登记的宿主源 → 防开放重定向
+    f"bh={'0' * 64}&return=http://host.test/embed-host",  # 非 https
+    "bh=not-a-hash&return=https://host.test/embed-host",
+])
+def test_top_navigation_rejects_bad_params(embed, query):
+    assert embed.test_client().get(f"/embed/auth/top?{query}").status_code == 400
