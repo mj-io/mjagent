@@ -22,6 +22,30 @@
     $("steps").appendChild(li);
   }
 
+  // 登录按钮状态：请求发出后立刻给反馈（企微里顶层跳转可能要等好几秒才离开本页），防止重复点击
+  const LOGIN_LABEL = $("login").textContent;
+  let busyWatchdog = null;
+  function setBusy(text, watchdogMs) {
+    const b = $("login");
+    b.disabled = true;
+    b.setAttribute("aria-busy", "true");
+    b.textContent = text;
+    clearTimeout(busyWatchdog);
+    if (watchdogMs) {
+      busyWatchdog = setTimeout(() => {
+        clearBusy();
+        step("跳转长时间没有生效（网络慢或被拦截），可以再点一次登录", "warn");
+      }, watchdogMs);
+    }
+  }
+  function clearBusy() {
+    const b = $("login");
+    clearTimeout(busyWatchdog);
+    b.disabled = false;
+    b.removeAttribute("aria-busy");
+    b.textContent = LOGIN_LABEL;
+  }
+
   function headers(extra) {
     const h = Object.assign({}, extra || {});
     if (sessionToken) h[cfg.sessionHeader] = sessionToken;
@@ -102,16 +126,21 @@
     if (!topNav) { step("无法顶层跳转：宿主页未传 host_url", "bad"); return; }
     if (!ss.set(K_PENDING, topNav.binding)) { step("sessionStorage 不可用，跳回后无法完成登录", "bad"); return; }
     step("弹窗不可用，改为顶层跳转登录（完成后回到本页）", "warn");
+    // 跳转成功时本页会被替换，看门狗不会触发；15 秒还在本页说明跳转没生效，恢复按钮
+    setBusy("正在跳转 PingOne…", 15000);
     try {
       // replace 而非 href 赋值：不新增历史记录。否则登录回来后按「返回」会退到登录前的宿主页快照（bfcache），显示未登录
       window.top.location.replace(topNav.url);
     } catch (e) {
+      clearBusy();
       // sandbox 缺 allow-top-navigation-by-user-activation，或浏览器不认这次点击：给一个原生 target=_top 链接再点一次
       step("弹窗被拦截且本次点击已不能跳转顶层窗口，请点下方「前往登录」", "warn");
       const a = document.createElement("a");
       a.href = topNav.url; a.target = "_top"; a.textContent = "前往登录"; a.className = "btn small primary";
       // 新的一次点击 = 新的用户激活：优先 replace（不留历史记录），不行再让原生 target=_top 链接生效
       a.addEventListener("click", (ev) => {
+        setBusy("正在跳转 PingOne…", 15000);
+        a.remove();
         try { window.top.location.replace(topNav.url); ev.preventDefault(); } catch (err) { /* 交给原生链接 */ }
       });
       $("steps").appendChild(a);
@@ -123,6 +152,11 @@
     const binding = ss.get(K_PENDING);
     if (!binding) return false;
     step("检测到未完成的顶层跳转登录，正在确认…");
+    setBusy("正在确认登录…");
+    try { return await resumeTopNavInner(binding); } finally { clearBusy(); }
+  }
+
+  async function resumeTopNavInner(binding) {
     for (let i = 0; i < 5; i++) {
       const s = await fetch("/embed/auth/status", { headers: { "X-Embed-Binding": binding } }).then((x) => x.json()).catch(() => ({}));
       if (s.status === "done") { ss.del(K_PENDING); await finish({ flow_id: s.flow_id }, binding); return true; }
@@ -141,23 +175,25 @@
   const NO_POPUP = /wxwork|MicroMessenger/i.test(navigator.userAgent);
 
   $("login").addEventListener("click", async () => {
+    if ($("login").disabled) return;
     if (NO_POPUP) { goTop(); return; }
     // 必须在点击回调里**同步**打开弹窗（先 about:blank），await 之后再开会被浏览器拦截
     const popup = window.open("about:blank", "mjagent-login", "width=480,height=680");
     if (!popup) { goTop(); return; }   // 弹窗被拦截：激活已被消耗，goTop 失败时会给出 target=_top 链接再点一次
     step("已在点击中同步打开顶层弹窗");
+    setBusy("等待登录完成…");
     const binding = randomHex(32);          // 只在本 iframe 内存里；服务端只存其 SHA-256
     let r;
     try {
       r = await api("/embed/auth/begin", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ binding }) })
         .then((x) => x.json());
-    } catch (e) { popup.close(); step("begin 失败：" + e.message, "bad"); return; }
+    } catch (e) { popup.close(); clearBusy(); step("begin 失败：" + e.message, "bad"); return; }
     const flowId = r.flow_id;
     step(`begin 完成，flow=${flowId.slice(0, 8)}…；弹窗跳转 PingOne`);
     popup.location.href = r.start_url;
 
-    let done = false;
-    const stop = () => { done = true; window.removeEventListener("message", onMsg); clearInterval(timer); };
+    let done = false, closedPolls = 0;
+    const stop = () => { done = true; window.removeEventListener("message", onMsg); clearInterval(timer); clearBusy(); };
     const onMsg = async (e) => {
       if (e.origin !== ORIGIN || e.source !== popup || !e.data || e.data.type !== "mjagent-login") return;
       if (done) return;
@@ -173,7 +209,10 @@
         .then((x) => x.json()).catch(() => ({}));
       if (s.status === "done") { stop(); step("轮询发现登录已完成（postMessage 未到达，可能 opener 被切断）", "warn"); await finish({ flow_id: flowId }, binding); }
       else if (s.status === "error") { stop(); step("登录失败：" + (s.error || ""), "bad"); }
-      else if (popup.closed && s.status !== "done") { /* 用户关掉了弹窗：继续等几轮，回调可能刚好在关闭前完成 */ }
+      else if (popup.closed && ++closedPolls >= 3) {
+        // 用户关掉了弹窗：多等几轮（回调可能刚好在关闭前完成），仍未完成就恢复按钮
+        stop(); step("登录窗口已关闭，未完成登录", "warn");
+      }
     }, 1500);
     setTimeout(() => { if (!done) { stop(); step("登录超时（5 分钟）", "bad"); } }, 5 * 60 * 1000);
   });
@@ -260,6 +299,7 @@
   // 从往返缓存（bfcache）恢复的旧页面：iframe 状态是快照，重新确认会话（也接住恢复时尚未完成的顶层跳转登录）
   window.addEventListener("pageshow", async (e) => {
     if (!e.persisted) return;
+    clearBusy();   // 快照里可能停在「正在跳转…」
     step("页面从往返缓存恢复，重新确认登录状态");
     sessionToken = ss.get(K_TOKEN);
     if (!(await resumeTopNav())) await whoami();

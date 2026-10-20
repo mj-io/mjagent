@@ -6,10 +6,10 @@
   {% if error %}<div class="alert">{{ error }}</div>{% endif %}
   <div class="buttons">
     {% if cfg.pingone_enabled %}
-    <a class="btn primary" href="{{ url_for('pingone_login') }}">使用 PingOne 登录</a>
+    <a class="btn primary js-login" href="{{ url_for('pingone_login') }}" data-busy="正在跳转 PingOne…">使用 PingOne 登录</a>
     {% endif %}
     {% if cfg.wecom_enabled %}
-    <a class="btn" href="{{ url_for('wecom_login') }}">使用企业微信登录</a>
+    <a class="btn js-login" href="{{ url_for('wecom_login') }}" data-busy="正在跳转企业微信…">使用企业微信登录</a>
     {% endif %}
     {% if not cfg.pingone_enabled and not cfg.wecom_enabled %}
     <div class="alert">未配置任何登录方式：请在 .env 中配置 PINGONE_* 或 WECOM_*，以及对应的 SCUTUM_*_CLIENT_ID。</div>
@@ -20,4 +20,18 @@
     <dt>Lyra A2A</dt><dd>{{ cfg.lyra_resource or '未配置' }}</dd>
   </dl>
 </section>
+{% endblock %}
+{% block scripts %}
+<script>
+  // 点击后立即给反馈并防重复点击：跳转 IdP 在慢网络 / 企业微信里可能要等几秒
+  document.querySelectorAll(".js-login").forEach(function (a) {
+    a.addEventListener("click", function (ev) {
+      if (a.getAttribute("aria-busy") === "true") { ev.preventDefault(); return; }
+      a.setAttribute("aria-busy", "true");
+      a.textContent = a.dataset.busy;
+    });
+  });
+  // 从往返缓存返回时恢复按钮
+  window.addEventListener("pageshow", function (e) { if (e.persisted) location.reload(); });
+</script>
 {% endblock %}

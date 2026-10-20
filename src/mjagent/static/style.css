@@ -66,3 +66,8 @@ body.embed main.embed-main { max-width: none; gap: 12px; display: flex; flex-dir
 .steps li { padding: 2px 0; }
 .steps .ok { color: #1a7f37; } .steps .bad { color: var(--danger); } .steps .warn { color: #9a6700; }
 [hidden] { display: none !important; }
+/* 登录按钮处理中：转圈 + 不可点，但不像禁用那样灰掉，让人知道请求已发出 */
+.btn[aria-busy="true"] { opacity: .9; cursor: progress; gap: 6px; }
+.btn[aria-busy="true"]::before { content: ""; width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid currentColor; border-right-color: transparent; animation: mj-spin .8s linear infinite; }
+@keyframes mj-spin { to { transform: rotate(360deg); } }
