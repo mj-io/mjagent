@@ -29,6 +29,7 @@ from flask import (
 from mjagent import wecom
 from mjagent.a2a_client import A2AClient, A2AError
 from mjagent.config import Config, load_config
+from mjagent.embed import FLOW_COOKIE, SESSION_HEADER, EmbedFlows, origin_of
 from mjagent.pingone import PingOneClient, PingOneError, pkce_pair
 from mjagent.scutum_client import ScutumClient, ScutumError
 from mjagent.store import SessionStore, UserSession
@@ -66,15 +67,23 @@ def create_app(cfg: Config | None = None) -> Flask:
     cfg = cfg or load_config()
     app = Flask(__name__)
     app.secret_key = cfg.secret_key
-    app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
-                      SESSION_COOKIE_SECURE=cfg.app_base_url.startswith("https://"))
+    if cfg.embed_mode:
+        # 被 iframe 嵌入：本应用处于第三方上下文，会话 cookie 必须 SameSite=None; Secure，
+        # 并加 Partitioned（CHIPS）：按顶层站点分区存储，不被当作跨站追踪 cookie 拦截
+        app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="None", SESSION_COOKIE_SECURE=True,
+                          SESSION_COOKIE_PARTITIONED=True)
+    else:
+        app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                          SESSION_COOKIE_SECURE=cfg.app_base_url.startswith("https://"))
     app.extensions["mjagent.cfg"] = cfg
     store = SessionStore()
     app.extensions["mjagent.store"] = store
+    flows = EmbedFlows()
+    app.extensions["mjagent.embed"] = flows
 
-    def pingone() -> PingOneClient:
+    def pingone(callback_path: str = "/auth/pingone/callback") -> PingOneClient:
         return PingOneClient(cfg.pingone_issuer, cfg.pingone_client_id, cfg.pingone_client_secret, cfg.pingone_scopes,
-                             f"{cfg.app_base_url}/auth/pingone/callback", verify=cfg.http_verify)
+                             f"{cfg.app_base_url}{callback_path}", verify=cfg.http_verify)
 
     def scutum(idp: str) -> ScutumClient:
         if idp == "wecom":
@@ -83,8 +92,37 @@ def create_app(cfg: Config | None = None) -> Flask:
         return ScutumClient(cfg.scutum_issuer, cfg.scutum_pingone_client_id, cfg.scutum_pingone_client_secret,
                             resource=cfg.lyra_resource, verify=cfg.http_verify)
 
+    def auth_channel() -> tuple[str | None, str | None]:
+        """(sid, 通道)：会话 cookie 优先；嵌入模式下 cookie 被拦截时，用 iframe 内存里的 session token（请求头）兜底。"""
+        sid = session.get("sid")
+        if sid and store.get(sid):
+            return sid, "cookie"
+        if cfg.embed_mode:
+            sid = flows.sid_for_token(request.headers.get(SESSION_HEADER))
+            if sid and store.get(sid):
+                return sid, "header"
+        return None, None
+
     def current() -> UserSession | None:
-        return store.get(session.get("sid"))
+        return store.get(auth_channel()[0])
+
+    def complete_pingone_login(client: PingOneClient, code: str, verifier: str, nonce: str) -> UserSession:
+        """授权码 → PingOne token → 建立本应用会话 → Scutum 交换（失败不影响登录，聊天时再提示原因）。"""
+        tok = client.exchange_code(code, verifier)
+        claims = client.verify_id_token(tok["id_token"], nonce)
+        sess = UserSession(idp="pingone", subject=claims["sub"], email=claims.get("email"),
+                           display_name=claims.get("name") or claims.get("preferred_username") or claims.get("email") or claims["sub"],
+                           id_token_claims=claims, pingone_access_token=tok.get("access_token"),
+                           pingone_id_token=tok["id_token"], pingone_expires_at=time.time() + int(tok.get("expires_in", 3600)))
+        sess.log("login", idp="pingone", sub=claims["sub"], email=claims.get("email"), scope=tok.get("scope"))
+        kind = cfg.pingone_subject_token
+        try:
+            sess.scutum = scutum("pingone").exchange_pingone(
+                sess.pingone_id_token if kind == "id_token" else sess.pingone_access_token or "", token_kind=kind)
+            sess.log("token_exchange", idp="pingone", result="ok", subject_token=kind, expires_in=int(sess.scutum.expires_at - time.time()))
+        except ScutumError as e:
+            sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
+        return sess
 
     def login_url_for(idp: str) -> str:
         return url_for("wecom_login") if idp == "wecom" else url_for("pingone_login")
@@ -144,6 +182,129 @@ def create_app(cfg: Config | None = None) -> Flask:
         store.drop(session.pop("sid", None))
         return redirect(url_for("index"))
 
+    # ------------------------------------------------------------------ iframe 嵌入：宿主页（agentx.htltio.cn 扮演 CRM）
+
+    @app.get("/embed-host")
+    def embed_host():
+        if not cfg.embed_app_url:
+            abort(404)
+        resp = Response(render_template("embed_host.html", cfg=cfg, user=None, app_origin=origin_of(cfg.embed_app_url)))
+        # CSP frame-src 只放行登记过的嵌入应用
+        resp.headers["Content-Security-Policy"] = f"frame-src {origin_of(cfg.embed_app_url)}"
+        return resp
+
+    # ------------------------------------------------------------------ iframe 嵌入：被嵌入方（agentx.mjio.cn）
+
+    def _embed_only():
+        if not cfg.embed_mode or not cfg.pingone_enabled:
+            abort(404)
+
+    @app.get("/embed/app")
+    def embed_app():
+        _embed_only()
+        resp = Response(render_template("embed_app.html", cfg=cfg, user=None, origin=origin_of(cfg.app_base_url),
+                                        session_header=SESSION_HEADER))
+        resp.headers["Content-Security-Policy"] = f"frame-ancestors 'self' {cfg.embed_frame_ancestors}".strip()
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/embed/auth/begin")
+    def embed_begin():
+        _embed_only()
+        binding = (request.get_json(silent=True) or {}).get("binding") or ""
+        if len(binding) < 32:
+            return jsonify(error="binding required (>= 32 chars, random, kept in iframe memory)"), 400
+        flow_id = flows.begin(binding)
+        resp = jsonify(flow_id=flow_id, start_url=url_for("embed_start", flow_id=flow_id))
+        # 只用于观测：iframe 分区 cookie 能否写入 / 带回（Safari 等可能整体拦截）；安全绑定靠 binding
+        resp.set_cookie(FLOW_COOKIE, flow_id, max_age=600, path="/embed", secure=True, httponly=True,
+                        samesite="None", partitioned=True)
+        return resp
+
+    @app.get("/embed/auth/start")
+    def embed_start():
+        """在弹窗（顶层窗口）里执行：把弹窗送去 PingOne。"""
+        _embed_only()
+        flow_id = request.args.get("flow_id")
+        f = flows.get(flow_id)
+        if f is None or f.status not in ("pending", "started"):
+            return render_template("embed_callback.html", cfg=cfg, user=None, code=None, origin=origin_of(cfg.app_base_url),
+                                   error="登录流程不存在或已过期，请回到原页面重新点击登录"), 400
+        verifier, challenge = pkce_pair()
+        f.state, f.nonce, f.verifier, f.status = secrets.token_urlsafe(16), secrets.token_urlsafe(16), verifier, "started"
+        flows.attach_state(flow_id, f.state)
+        return redirect(pingone("/embed/auth/callback").authorization_url(state=f.state, nonce=f.nonce, code_challenge=challenge))
+
+    @app.get("/embed/auth/callback")
+    def embed_callback():
+        """PingOne 回调（仍在弹窗里）：服务端换 token、建会话，回调页 postMessage 一次性 handoff code 给 iframe。"""
+        _embed_only()
+        hit = flows.by_state(request.args.get("state"))
+        origin = origin_of(cfg.app_base_url)
+        if hit is None:
+            return render_template("embed_callback.html", cfg=cfg, user=None, code=None, origin=origin,
+                                   error="state 无效或已使用，请回到原页面重新登录"), 400
+        flow_id, f = hit
+        if request.args.get("error"):
+            f.status, f.error = "error", request.args.get("error_description") or request.args["error"]
+            return render_template("embed_callback.html", cfg=cfg, user=None, code=None, origin=origin, error=f"PingOne：{f.error}")
+        try:
+            sess = complete_pingone_login(pingone("/embed/auth/callback"), request.args.get("code", ""), f.verifier or "", f.nonce or "")
+        except (PingOneError, jwt.PyJWTError, KeyError) as e:
+            logger.warning("embed PingOne login failed: %s", e)
+            f.status, f.error = "error", str(e)
+            return render_template("embed_callback.html", cfg=cfg, user=None, code=None, origin=origin, error=f"PingOne 登录失败：{e}")
+        sess.log("embed", step="popup_callback", flow=flow_id[:8])
+        f.sid, f.status = store.put(sess), "done"
+        f.user = {"name": sess.display_name, "email": sess.email}
+        return render_template("embed_callback.html", cfg=cfg, user=None, code=flows.issue_handoff(flow_id), origin=origin, error=None)
+
+    @app.get("/embed/auth/status")
+    def embed_status():
+        """轮询兜底（opener 被 COOP 切断时 postMessage 收不到）：只对持有 binding 的 iframe 回答。"""
+        _embed_only()
+        f = flows.get(request.args.get("flow_id"))
+        if f is None or not flows.binding_ok(f, request.headers.get("X-Embed-Binding")):
+            return jsonify(status="unknown"), 404
+        return jsonify(status=f.status, error=f.error)
+
+    @app.post("/embed/auth/finish")
+    def embed_finish():
+        _embed_only()
+        body = request.get_json(silent=True) or {}
+        cookie_flow = request.cookies.get(FLOW_COOKIE)
+        f, reason = flows.consume(binding=body.get("binding") or "", code=body.get("code"), flow_id=body.get("flow_id"))
+        if f is None:
+            return jsonify(error="invalid_grant", message=reason), 400
+        sess = store.get(f.sid)
+        if sess is None:
+            return jsonify(error="invalid_grant", message="session expired"), 400
+        session["sid"] = f.sid                       # Partitioned 会话 cookie（浏览器允许时生效）
+        token = flows.issue_session_token(f.sid)     # cookie 被拦截时的兜底：iframe 只放内存，随请求头带上
+        via = "postMessage" if body.get("code") else "polling"
+        sess.log("embed", step="finish", via=via, flow_cookie_seen=bool(cookie_flow))
+        resp = jsonify(ok=True, user=f.user, session_token=token, via=via, flow_cookie_seen=bool(cookie_flow))
+        resp.delete_cookie(FLOW_COOKIE, path="/embed", secure=True, httponly=True, samesite="None", partitioned=True)
+        return resp
+
+    @app.get("/embed/whoami")
+    def embed_whoami():
+        _embed_only()
+        sid, channel = auth_channel()
+        sess = store.get(sid)
+        return jsonify(logged_in=bool(sess), channel=channel, user={"name": sess.display_name, "email": sess.email} if sess else None,
+                       session_cookie_seen=bool(request.cookies.get(app.config["SESSION_COOKIE_NAME"])),
+                       lyra_token=bool(sess and sess.scutum and not sess.scutum.expired))
+
+    @app.post("/embed/logout")
+    def embed_logout():
+        _embed_only()
+        sid, _ = auth_channel()
+        store.drop(sid)
+        session.pop("sid", None)
+        flows.drop_token(request.headers.get(SESSION_HEADER))
+        return jsonify(ok=True)
+
     @app.get("/healthz")
     def healthz():
         return {"ok": True, "pingone": cfg.pingone_enabled, "wecom": cfg.wecom_enabled}
@@ -166,26 +327,11 @@ def create_app(cfg: Config | None = None) -> Flask:
             return redirect(url_for("index", error=f"PingOne: {request.args.get('error_description') or request.args['error']}"))
         if not pending or request.args.get("state") != pending["state"]:
             return redirect(url_for("index", error="PingOne 回调 state 不匹配，请重新登录"))
-        client = pingone()
         try:
-            tok = client.exchange_code(request.args.get("code", ""), pending["verifier"])
-            claims = client.verify_id_token(tok["id_token"], pending["nonce"])
+            sess = complete_pingone_login(pingone(), request.args.get("code", ""), pending["verifier"], pending["nonce"])
         except (PingOneError, jwt.PyJWTError, KeyError) as e:
             logger.warning("PingOne login failed: %s", e)
             return redirect(url_for("index", error=f"PingOne 登录失败：{e}"))
-        sess = UserSession(idp="pingone", subject=claims["sub"], email=claims.get("email"),
-                           display_name=claims.get("name") or claims.get("preferred_username") or claims.get("email") or claims["sub"],
-                           id_token_claims=claims, pingone_access_token=tok.get("access_token"),
-                           pingone_id_token=tok["id_token"], pingone_expires_at=time.time() + int(tok.get("expires_in", 3600)))
-        sess.log("login", idp="pingone", sub=claims["sub"], email=claims.get("email"), scope=tok.get("scope"))
-        kind = cfg.pingone_subject_token
-        try:
-            sess.scutum = scutum("pingone").exchange_pingone(
-                sess.pingone_id_token if kind == "id_token" else sess.pingone_access_token or "", token_kind=kind)
-            sess.log("token_exchange", idp="pingone", result="ok", subject_token=kind, expires_in=int(sess.scutum.expires_at - time.time()))
-        except ScutumError as e:
-            # 登录本身成功（客户应用自己的会话），只是换不到 Lyra token：照样进入，聊天时提示原因
-            sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
         session["sid"] = store.put(sess)
         return redirect(url_for("chat"))
 

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}嵌入测试 · 宿主页{% endblock %}
+{% block content %}
+<section class="card host-intro">
+  <h1>iframe 嵌入测试（宿主页）</h1>
+  <p class="muted">本页扮演 CRM：用 iframe 嵌入第三方客户应用 <code>{{ app_origin }}</code>。iframe 内点击「登录」后，
+    登录在<strong>顶层弹窗</strong>中完成（PingOne 登录页拒绝被嵌入，且 iframe 内 IdP / 应用 cookie 属第三方），
+    弹窗通过 postMessage 把一次性 code 交回 iframe，iframe 再建立自己的（分区）会话。</p>
+  <p class="muted">iframe 属性：<code>sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"</code>；
+    本页 CSP <code>frame-src {{ app_origin }}</code>。对照：<a href="{{ cfg.embed_app_url }}" target="_blank" rel="noopener">在顶层直接打开嵌入页</a>。</p>
+</section>
+<div class="host-frame">
+  <iframe src="{{ cfg.embed_app_url }}" title="嵌入的客户应用"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>
+</div>
+{% endblock %}

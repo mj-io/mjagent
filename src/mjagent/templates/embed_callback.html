@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录{{ '失败' if error else '完成' }} · MJ Agent</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main>
+    <section class="card login">
+      {% if error %}
+        <h1>登录失败</h1>
+        <div class="alert">{{ error }}</div>
+      {% else %}
+        <h1>登录完成</h1>
+        <p class="muted" id="msg">正在返回原页面…</p>
+      {% endif %}
+    </section>
+  </main>
+  {% if not error %}
+  <script>
+    // 一次性 handoff code（60 秒、单次有效），不是 token；targetOrigin 写死为本应用源，不用 "*"
+    (function () {
+      var msg = document.getElementById("msg");
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({ type: "mjagent-login", code: {{ code | tojson }} }, {{ origin | tojson }});
+        msg.textContent = "已通知原页面，窗口即将关闭。";
+        setTimeout(function () { window.close(); }, 300);
+      } else {
+        // opener 被 COOP 切断（或用户已关掉原页面）：原页面 iframe 会通过轮询自动完成登录
+        msg.textContent = "已登录。原页面会自动完成登录，可以关闭此窗口。";
+      }
+    })();
+  </script>
+  {% endif %}
+</body>
+</html>

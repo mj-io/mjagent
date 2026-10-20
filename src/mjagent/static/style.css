@@ -55,3 +55,13 @@ pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; 
 .checks { list-style: none; padding: 0; margin: 0; font-size: 14px; }
 .checks li { padding: 4px 0; }
 .checks .ok { color: #1a7f37; } .checks .bad { color: var(--danger); }
+/* ---- iframe 嵌入测试 ---- */
+.host-intro { margin-bottom: 12px; }
+.host-intro code { word-break: break-all; }
+.host-frame { flex: 1; min-height: 640px; border: 2px dashed var(--brand); border-radius: 12px; overflow: hidden; background: var(--card); }
+.host-frame iframe { width: 100%; height: 100%; min-height: 640px; border: 0; display: block; }
+body.embed main.embed-main { max-width: none; gap: 12px; display: flex; flex-direction: column; }
+.embed-chat { min-height: 260px; }
+.steps { margin: 0; padding-left: 20px; font-size: 13px; }
+.steps li { padding: 2px 0; }
+.steps .ok { color: #1a7f37; } .steps .bad { color: var(--danger); } .steps .warn { color: #9a6700; }

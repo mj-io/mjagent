@@ -45,6 +45,14 @@ class Config:
     lyra_resource: str                  # RFC 8707 resource（= token aud），如 https://host/lyra/a2a
     http_verify: bool = True
 
+    # ---- iframe 嵌入（ORI-159317 iframe 内外 PingOne 授权测试）----
+    # 被嵌入方（agentx.mjio.cn）：开启 /embed/*，会话 cookie 改为 SameSite=None; Secure; Partitioned
+    embed_mode: bool = False
+    # 允许嵌入本应用 /embed/app 的宿主（CSP frame-ancestors），空格分隔
+    embed_frame_ancestors: str = ""
+    # 宿主方（agentx.htltio.cn）：/embed-host 页面用 iframe 加载的地址
+    embed_app_url: str = ""
+
     @property
     def pingone_enabled(self) -> bool:
         # 不要求 Scutum client：PingOne 登录是客户应用自己的事，交换失败会在调试页 / 对话里提示
@@ -56,7 +64,8 @@ class Config:
 
 
 def load_config() -> Config:
-    load_dotenv()
+    # 同一份代码跑多个实例（agentx.htltio.cn / agentx.mjio.cn）：MJAGENT_ENV_FILE 指定各自的 dotenv
+    load_dotenv(os.environ.get("MJAGENT_ENV_FILE", ".env"))
     return Config(
         secret_key=_env("FLASK_SECRET_KEY") or os.urandom(32).hex(),
         app_base_url=_env("APP_BASE_URL", "http://localhost:5000").rstrip("/"),
@@ -76,4 +85,7 @@ def load_config() -> Config:
         lyra_base_url=_env("LYRA_BASE_URL").rstrip("/"),
         lyra_resource=_env("LYRA_RESOURCE").rstrip("/"),
         http_verify=_bool("HTTP_VERIFY_TLS", True),
+        embed_mode=_bool("EMBED_MODE", False),
+        embed_frame_ancestors=_env("EMBED_FRAME_ANCESTORS"),
+        embed_app_url=_env("EMBED_APP_URL"),
     )

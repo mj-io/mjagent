@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>嵌入应用 · MJ Agent</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="embed">
+  <div id="embed-cfg" hidden data-origin="{{ origin }}" data-session-header="{{ session_header }}"></div>
+  <header class="topbar">
+    <span class="brand">{{ origin.split('//')[1] }} <span class="tag">嵌入页</span></span>
+    <nav>
+      <span id="who" class="who"></span>
+      <button id="login" class="btn small primary" type="button">使用 PingOne 登录</button>
+      <button id="logout" class="btn small" type="button" hidden>退出</button>
+    </nav>
+  </header>
+  <main class="embed-main">
+    <section class="card env">
+      <h2>运行环境</h2>
+      <dl id="env" class="kv"></dl>
+    </section>
+    <section class="chat embed-chat" id="chat" hidden>
+      <div class="toolbar"><select id="agent" aria-label="选择 agent"></select></div>
+      <div id="log" class="log" aria-live="polite"></div>
+      <form id="composer" class="composer" autocomplete="off">
+        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送" required></textarea>
+        <button class="btn primary" type="submit" id="send">发送</button>
+      </form>
+    </section>
+    <section class="card">
+      <h2>登录步骤</h2>
+      <ol id="steps" class="steps"></ol>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='embed.js') }}"></script>
+</body>
+</html>
