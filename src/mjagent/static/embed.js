@@ -103,12 +103,17 @@
     if (!ss.set(K_PENDING, topNav.binding)) { step("sessionStorage 不可用，跳回后无法完成登录", "bad"); return; }
     step("弹窗不可用，改为顶层跳转登录（完成后回到本页）", "warn");
     try {
-      window.top.location.href = topNav.url;
+      // replace 而非 href 赋值：不新增历史记录。否则登录回来后按「返回」会退到登录前的宿主页快照（bfcache），显示未登录
+      window.top.location.replace(topNav.url);
     } catch (e) {
       // sandbox 缺 allow-top-navigation-by-user-activation，或浏览器不认这次点击：给一个原生 target=_top 链接再点一次
       step("弹窗被拦截且本次点击已不能跳转顶层窗口，请点下方「前往登录」", "warn");
       const a = document.createElement("a");
       a.href = topNav.url; a.target = "_top"; a.textContent = "前往登录"; a.className = "btn small primary";
+      // 新的一次点击 = 新的用户激活：优先 replace（不留历史记录），不行再让原生 target=_top 链接生效
+      a.addEventListener("click", (ev) => {
+        try { window.top.location.replace(topNav.url); ev.preventDefault(); } catch (err) { /* 交给原生链接 */ }
+      });
       $("steps").appendChild(a);
     }
   }
@@ -250,6 +255,14 @@
   });
   $("input").addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); $("composer").requestSubmit(); }
+  });
+
+  // 从往返缓存（bfcache）恢复的旧页面：iframe 状态是快照，重新确认会话（也接住恢复时尚未完成的顶层跳转登录）
+  window.addEventListener("pageshow", async (e) => {
+    if (!e.persisted) return;
+    step("页面从往返缓存恢复，重新确认登录状态");
+    sessionToken = ss.get(K_TOKEN);
+    if (!(await resumeTopNav())) await whoami();
   });
 
   (async () => {
