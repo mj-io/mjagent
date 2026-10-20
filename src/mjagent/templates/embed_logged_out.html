@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>已登出 PingOne · MJ Agent</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v=asset_v) }}">
+</head>
+<body>
+  <main>
+    <section class="card login">
+      {% if error %}
+        <h1>登出失败</h1>
+        <div class="alert">{{ error }}</div>
+      {% else %}
+        <h1>已登出 PingOne</h1>
+        <p class="muted" id="msg">可以用其它账号重新登录了。</p>
+      {% endif %}
+    </section>
+  </main>
+  {% if not error %}
+  <script>
+    (function () {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({ type: "mjagent-logout" }, {{ origin | tojson }});
+        document.getElementById("msg").textContent = "已通知原页面，窗口即将关闭。";
+        setTimeout(function () { window.close(); }, 300);
+      }
+    })();
+  </script>
+  {% endif %}
+</body>
+</html>

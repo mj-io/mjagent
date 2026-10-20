@@ -47,7 +47,8 @@ class World:
         url = str(req.url)
         if url == f"{ISS}/.well-known/openid-configuration":
             return httpx.Response(200, json={"issuer": ISS, "authorization_endpoint": f"{ISS}/authorize",
-                                             "token_endpoint": f"{ISS}/token", "jwks_uri": f"{ISS}/jwks"})
+                                             "token_endpoint": f"{ISS}/token", "jwks_uri": f"{ISS}/jwks",
+                                             "end_session_endpoint": f"{ISS}/signoff"})
         if url == f"{ISS}/token":
             now = int(time.time())
             id_token = jwt.encode({"iss": ISS, "aud": "p1-app", "sub": "p1-alice", "email": "alice@contoso.com",
@@ -198,3 +199,12 @@ def test_scutum_client_error_mapping():
     with pytest.raises(ScutumError) as ei:
         c.exchange_wecom_code("code")
     assert ei.value.error == "invalid_grant" and ei.value.status == 400
+
+
+def test_pingone_logout_clears_sso(client, world):
+    _pingone_login(client, world)
+    r = client.get("/auth/pingone/logout")
+    q = parse_qs(urlparse(r.headers["Location"]).query)
+    assert r.status_code == 302 and r.headers["Location"].startswith(f"{ISS}/signoff?")
+    assert q["post_logout_redirect_uri"] == ["https://mjagent.test/"] and q["id_token_hint"][0].count(".") == 2 and q["state"]
+    assert client.get("/api/agents").status_code == 401       # 本应用会话已清

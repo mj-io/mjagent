@@ -146,3 +146,46 @@ def test_top_navigation_fallback(embed, world):  # noqa: F811
 ])
 def test_top_navigation_rejects_bad_params(embed, query):
     assert embed.test_client().get(f"/embed/auth/top?{query}").status_code == 400
+
+
+def _embed_login(embed, world):  # noqa: F811
+    iframe = embed.test_client()
+    flow_id = _begin(iframe).json["flow_id"]
+    _, code = _popup_login(embed, world, flow_id)
+    token = iframe.post("/embed/auth/finish", json={"code": code, "binding": BINDING}).json["session_token"]
+    return iframe, token
+
+
+def test_embed_pingone_logout_popup(embed, world):  # noqa: F811
+    iframe, token = _embed_login(embed, world)
+    t = iframe.post("/embed/auth/logout-ticket", json={"host_url": "https://host.test/embed-host"}).json
+    assert t["popup_url"].startswith("https://embed.test/embed/auth/pingone-logout?") and "mode=top" in t["top_url"]
+    popup = embed.test_client()                                     # 弹窗：没有 iframe 的 cookie / token
+    r = popup.get(t["popup_url"].replace("https://embed.test", ""))
+    q = parse_qs(urlparse(r.headers["Location"]).query)
+    assert r.headers["Location"].startswith("https://auth.pingone.test/env-1/as/signoff?")
+    assert q["post_logout_redirect_uri"] == ["https://embed.test/embed/auth/logged-out"] and q["id_token_hint"]
+    # 本应用会话已清（cookie 与内存 token 两条通道都失效）
+    assert not iframe.get("/embed/whoami").json["logged_in"]
+    assert not embed.test_client().get("/embed/whoami", headers={"X-Embed-Session": token}).json["logged_in"]
+    # 票据单次有效；回跳页通知 opener
+    assert popup.get(t["popup_url"].replace("https://embed.test", "")).status_code == 400
+    page = popup.get(f"/embed/auth/logged-out?state={q['state'][0]}").get_data(as_text=True)
+    assert "mjagent-logout" in page and '"https://embed.test"' in page
+
+
+def test_embed_pingone_logout_top_returns_to_host(embed, world):  # noqa: F811
+    iframe, _ = _embed_login(embed, world)
+    t = iframe.post("/embed/auth/logout-ticket", json={"host_url": "https://host.test/embed-host"}).json
+    top = embed.test_client()
+    r = top.get(t["top_url"].replace("https://embed.test", ""))
+    state = parse_qs(urlparse(r.headers["Location"]).query)["state"][0]
+    r = top.get(f"/embed/auth/logged-out?state={state}")
+    assert r.status_code == 302 and r.headers["Location"] == "https://host.test/embed-host"
+
+
+def test_embed_logout_ticket_requires_session_and_valid_host(embed, world):  # noqa: F811
+    assert embed.test_client().post("/embed/auth/logout-ticket", json={}).status_code == 401
+    iframe, _ = _embed_login(embed, world)
+    t = iframe.post("/embed/auth/logout-ticket", json={"host_url": "https://evil.test/x"}).json
+    assert t["top_url"] is None                                    # 未登记的宿主不给顶层回跳地址

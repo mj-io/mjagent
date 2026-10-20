@@ -72,6 +72,8 @@ class EmbedFlows:
         self._by_state: dict[str, str] = {}
         self._handoffs: dict[str, tuple[str, float]] = {}
         self._tokens: dict[str, tuple[str, float]] = {}
+        self._logout_tickets: dict[str, tuple[str, str | None, float]] = {}
+        self._logout_states: dict[str, tuple[str, str | None, float]] = {}
 
     def _gc(self) -> None:
         now = time.time()
@@ -163,3 +165,35 @@ class EmbedFlows:
     def drop_token(self, token: str | None) -> None:
         with self._lock:
             self._tokens.pop(token or "", None)
+
+    def drop_tokens_for_sid(self, sid: str) -> None:
+        with self._lock:
+            for k in [k for k, (s, _) in self._tokens.items() if s == sid]:
+                self._tokens.pop(k, None)
+
+    # ---- 登出 PingOne（切换账号）：与登录同理，SSO cookie 在顶层第一方，必须弹窗 / 顶层跳转去 signoff ----
+    # 企业微信里顶层跳转必须在点击的同步调用栈里发生，所以登录后先领一张「登出票据」，点击时直接带票据跳转。
+
+    def issue_logout_ticket(self, sid: str, return_url: str | None) -> str:
+        with self._lock:
+            ticket = secrets.token_urlsafe(32)
+            self._logout_tickets[ticket] = (sid, return_url, time.time() + TOKEN_TTL)
+            return ticket
+
+    def consume_logout_ticket(self, ticket: str | None) -> tuple[str, str | None] | None:
+        with self._lock:
+            hit = self._logout_tickets.pop(ticket or "", None)
+            if not hit or hit[2] <= time.time():
+                return None
+            for k in [k for k, (sid, _, _) in self._logout_tickets.items() if sid == hit[0]]:
+                self._logout_tickets.pop(k, None)      # 同一会话的其它票据一并作废
+            return hit[0], hit[1]
+
+    def remember_logout_state(self, state: str, mode: str, return_url: str | None) -> None:
+        with self._lock:
+            self._logout_states[state] = (mode, return_url, time.time() + FLOW_TTL)
+
+    def pop_logout_state(self, state: str | None) -> tuple[str, str | None] | None:
+        with self._lock:
+            hit = self._logout_states.pop(state or "", None)
+            return (hit[0], hit[1]) if hit and hit[2] > time.time() else None

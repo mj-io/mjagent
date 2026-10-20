@@ -104,6 +104,8 @@
     $("who").textContent = r.logged_in ? `${r.user.name || ""} ${r.user.email ? "· " + r.user.email : ""}` : "";
     $("login").hidden = r.logged_in;
     $("logout").hidden = !r.logged_in;
+    $("p1logout").hidden = !r.logged_in;
+    if (r.logged_in) prepareLogoutTicket(); else logoutTicket = null;
     $("chat").hidden = !r.logged_in;
     if (r.logged_in) loadAgents();
     return r;
@@ -227,6 +229,63 @@
     step(`finish 成功（${body.via}）；begin 时下发的分区 flow cookie ${body.flow_cookie_seen ? "已带回" : "未带回"}`, "ok");
     await whoami();
   }
+
+  // ---------------------------------------------------------------- 登出 PingOne（切换账号）
+  // PingOne SSO cookie 在顶层第一方，iframe 里清不掉：弹窗（桌面）/ 顶层跳转（企业微信）去 signoff。
+  // 跳转必须在点击的同步调用栈里完成，所以登录后预领一次性登出票据。
+  let logoutTicket = null;
+  async function prepareLogoutTicket() {
+    const r = await api("/embed/auth/logout-ticket", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ host_url: HOST_URL }) }).catch(() => null);
+    logoutTicket = r && r.ok ? await r.json() : null;
+  }
+
+  function localLoggedOut() {
+    sessionToken = null;
+    ss.del(K_TOKEN);
+    logoutTicket = null;
+    $("log").innerHTML = "";
+  }
+
+  $("p1logout").addEventListener("click", () => {
+    const b = $("p1logout");
+    if (!logoutTicket) { step("登出票据还没准备好，稍等一秒再点", "warn"); prepareLogoutTicket(); return; }
+    const t = logoutTicket;
+    if (NO_POPUP || !t.popup_url) {
+      if (!t.top_url) { step("无法顶层跳转登出：宿主页未传 host_url", "bad"); return; }
+      localLoggedOut();
+      b.disabled = true; b.setAttribute("aria-busy", "true"); b.textContent = "正在登出 PingOne…";
+      step("顶层跳转到 PingOne 登出（完成后回到本页）", "warn");
+      try { window.top.location.replace(t.top_url); } catch (e) {
+        b.disabled = false; b.removeAttribute("aria-busy"); b.textContent = "登出 PingOne";
+        step("顶层跳转被拒绝：" + e.message, "bad");
+      }
+      return;
+    }
+    const popup = window.open(t.popup_url, "mjagent-logout", "width=480,height=560");
+    if (!popup) {
+      // 弹窗被拦截（激活已被消耗）：给原生 target=_top 链接再点一次
+      if (!t.top_url) { step("弹窗被拦截，且无法顶层跳转", "bad"); return; }
+      step("弹窗被拦截，请点下方「前往登出」", "warn");
+      const a = document.createElement("a");
+      a.href = t.top_url; a.target = "_top"; a.textContent = "前往登出"; a.className = "btn small";
+      a.addEventListener("click", (ev) => {
+        localLoggedOut(); a.remove();
+        try { window.top.location.replace(t.top_url); ev.preventDefault(); } catch (err) { /* 交给原生链接 */ }
+      });
+      $("steps").appendChild(a);
+      return;
+    }
+    localLoggedOut();
+    step("已在弹窗中登出 PingOne，本应用会话已清除");
+    const onMsg = (e) => {
+      if (e.origin !== ORIGIN || e.source !== popup || !e.data || e.data.type !== "mjagent-logout") return;
+      window.removeEventListener("message", onMsg);
+      step("PingOne 登出完成，可以换账号登录", "ok");
+    };
+    window.addEventListener("message", onMsg);
+    setTimeout(whoami, 1200);   // 弹窗打开票据链接时服务端即清会话
+  });
 
   $("logout").addEventListener("click", async () => {
     await api("/embed/logout", { method: "POST" });

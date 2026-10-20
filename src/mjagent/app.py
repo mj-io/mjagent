@@ -186,6 +186,17 @@ def create_app(cfg: Config | None = None) -> Flask:
         store.drop(session.pop("sid", None))
         return redirect(url_for("index"))
 
+    @app.get("/auth/pingone/logout")
+    def pingone_logout():
+        """切换账号：清本应用会话，再去 PingOne signoff 清 SSO 会话，完成后回首页（需登记 Signoff URL = {APP_BASE_URL}/）。"""
+        sess = current()
+        id_token = sess.pingone_id_token if sess and sess.idp == "pingone" else None
+        store.drop(session.pop("sid", None))
+        if not cfg.pingone_enabled:
+            return redirect(url_for("index"))
+        return redirect(pingone().logout_url(id_token_hint=id_token, post_logout_redirect_uri=f"{cfg.app_base_url}/",
+                                             state=secrets.token_urlsafe(16)))
+
     # ------------------------------------------------------------------ iframe 嵌入：宿主页（agentx.htltio.cn 扮演 CRM）
 
     @app.get("/embed-host")
@@ -322,6 +333,55 @@ def create_app(cfg: Config | None = None) -> Flask:
         sess.log("embed", step="finish", via=via, flow_cookie_seen=bool(cookie_flow))
         resp = jsonify(ok=True, user=f.user, session_token=token, via=via, flow_cookie_seen=bool(cookie_flow))
         resp.delete_cookie(FLOW_COOKIE, path="/embed", secure=True, httponly=True, samesite="None", partitioned=True)
+        return resp
+
+    @app.post("/embed/auth/logout-ticket")
+    def embed_logout_ticket():
+        """登录后预领登出票据：点击「登出 PingOne」时 iframe 同步跳转，来不及再发请求（企业微信顶层跳转限制）。"""
+        _embed_only()
+        sid, _ = auth_channel()
+        if not sid:
+            return jsonify(error="login_required"), 401
+        ret = _allowed_return((request.get_json(silent=True) or {}).get("host_url"))
+        ticket = flows.issue_logout_ticket(sid, ret)
+        base = cfg.app_base_url
+        return jsonify(popup_url=f"{base}{url_for('embed_pingone_logout', ticket=ticket, mode='popup')}",
+                       top_url=f"{base}{url_for('embed_pingone_logout', ticket=ticket, mode='top')}" if ret else None)
+
+    @app.get("/embed/auth/pingone-logout")
+    def embed_pingone_logout():
+        """弹窗 / 顶层窗口里执行：凭票据清掉本应用会话，再送去 PingOne signoff 清 SSO 会话。"""
+        _embed_only()
+        hit = flows.consume_logout_ticket(request.args.get("ticket"))
+        mode = "top" if request.args.get("mode") == "top" else "popup"
+        if hit is None:
+            return render_template("embed_logged_out.html", cfg=cfg, user=None, origin=origin_of(cfg.app_base_url),
+                                   error="登出票据无效或已使用，请回到原页面重试"), 400
+        sid, ret = hit
+        sess = store.get(sid)
+        id_token = sess.pingone_id_token if sess else None
+        store.drop(sid)
+        flows.drop_tokens_for_sid(sid)
+        state = secrets.token_urlsafe(16)
+        flows.remember_logout_state(state, mode, ret if mode == "top" else None)
+        resp = redirect(pingone("/embed/auth/callback").logout_url(
+            id_token_hint=id_token, post_logout_redirect_uri=f"{cfg.app_base_url}/embed/auth/logged-out", state=state))
+        if mode == "top" and ret:
+            # 兜底：PingOne 若不回传 state，靠这个顶层第一方 cookie 找回宿主页地址
+            resp.set_cookie("embed_logout_return", ret, max_age=600, path="/embed/auth", secure=True, httponly=True, samesite="Lax")
+        return resp
+
+    @app.get("/embed/auth/logged-out")
+    def embed_logged_out():
+        """PingOne 登出后的回跳（需登记 Signoff URL）：顶层模式回宿主页，弹窗模式通知 iframe 后关闭。"""
+        _embed_only()
+        info = flows.pop_logout_state(request.args.get("state"))
+        ret = (info[1] if info else None) or _allowed_return(request.cookies.get("embed_logout_return"))
+        if (info and info[0] == "top" or not info) and ret:
+            resp = redirect(ret)
+        else:
+            resp = Response(render_template("embed_logged_out.html", cfg=cfg, user=None, origin=origin_of(cfg.app_base_url), error=None))
+        resp.delete_cookie("embed_logout_return", path="/embed/auth", secure=True, httponly=True, samesite="Lax")
         return resp
 
     @app.get("/embed/whoami")

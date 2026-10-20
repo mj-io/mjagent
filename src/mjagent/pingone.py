@@ -67,6 +67,18 @@ class PingOneClient:
             params["prompt"] = prompt
         return f"{self.discovery()['authorization_endpoint']}?{urlencode(params)}"
 
+    def logout_url(self, *, id_token_hint: str | None, post_logout_redirect_uri: str, state: str) -> str:
+        """OIDC RP-Initiated Logout：清掉 PingOne 的 SSO 会话（切换账号用）。
+
+        post_logout_redirect_uri 必须登记在 PingOne 应用的 Signoff URLs 里，否则 PingOne 停在自己的登出页；
+        带上 id_token_hint，PingOne 才确认是哪个应用 / 会话发起的登出并允许跳回。
+        """
+        endpoint = self.discovery().get("end_session_endpoint") or f"{self.issuer}/signoff"
+        params = {"post_logout_redirect_uri": post_logout_redirect_uri, "state": state}
+        if id_token_hint:
+            params["id_token_hint"] = id_token_hint
+        return f"{endpoint}?{urlencode(params)}"
+
     def exchange_code(self, code: str, code_verifier: str) -> dict:
         """授权码换 token（client_secret_basic），返回 PingOne token 响应。"""
         data = {"grant_type": "authorization_code", "code": code, "redirect_uri": self.redirect_uri,
