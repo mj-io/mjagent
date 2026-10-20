@@ -48,6 +48,7 @@
     }
     const rows = [
       ["运行位置", inIframe ? "iframe（第三方上下文）" : "顶层窗口（第一方）"],
+      ["登录方式", NO_POPUP ? "顶层跳转（企业微信 / 微信内不支持弹窗）" : "弹窗 + postMessage（被拦截时改顶层跳转）"],
       ["宿主源", topOrigin],
       ["JS 写 Partitioned cookie", jsCookie ? "可以" : "被拦截"],
       ["hasStorageAccess", storageAccess],
@@ -105,7 +106,7 @@
       window.top.location.href = topNav.url;
     } catch (e) {
       // sandbox 缺 allow-top-navigation-by-user-activation，或浏览器不认这次点击：给一个原生 target=_top 链接再点一次
-      step("顶层跳转被拒绝：" + e.message + "；请点下方链接", "bad");
+      step("弹窗被拦截且本次点击已不能跳转顶层窗口，请点下方「前往登录」", "warn");
       const a = document.createElement("a");
       a.href = topNav.url; a.target = "_top"; a.textContent = "前往登录"; a.className = "btn small primary";
       $("steps").appendChild(a);
@@ -130,10 +131,15 @@
   }
 
   // ---------------------------------------------------------------- 登录：A 弹窗 + postMessage（轮询兜底）/ B 顶层跳转
+  // 已知不支持 window.open 的内嵌浏览器（企业微信 / 微信 WebView）直接走顶层跳转：window.open 即使返回 null 也会
+  // 消耗本次点击的用户激活，之后 window.top 导航会被拒（"does not have permission to navigate the target frame"）
+  const NO_POPUP = /wxwork|MicroMessenger/i.test(navigator.userAgent);
+
   $("login").addEventListener("click", async () => {
+    if (NO_POPUP) { goTop(); return; }
     // 必须在点击回调里**同步**打开弹窗（先 about:blank），await 之后再开会被浏览器拦截
     const popup = window.open("about:blank", "mjagent-login", "width=480,height=680");
-    if (!popup) { goTop(); return; }
+    if (!popup) { goTop(); return; }   // 弹窗被拦截：激活已被消耗，goTop 失败时会给出 target=_top 链接再点一次
     step("已在点击中同步打开顶层弹窗");
     const binding = randomHex(32);          // 只在本 iframe 内存里；服务端只存其 SHA-256
     let r;
