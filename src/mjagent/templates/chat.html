@@ -14,4 +14,4 @@
   </form>
 </section>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('static', filename='chat.js') }}"></script>{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='chat.js', v=asset_v) }}"></script>{% endblock %}

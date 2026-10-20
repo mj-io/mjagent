@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>嵌入应用 · MJ Agent</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v=asset_v) }}">
 </head>
 <body class="embed">
   <div id="embed-cfg" hidden data-origin="{{ origin }}" data-session-header="{{ session_header }}"></div>
@@ -34,6 +34,6 @@
       <ol id="steps" class="steps"></ol>
     </section>
   </main>
-  <script src="{{ url_for('static', filename='embed.js') }}"></script>
+  <script src="{{ url_for('static', filename='embed.js', v=asset_v) }}"></script>
 </body>
 </html>

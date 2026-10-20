@@ -78,6 +78,8 @@ def create_app(cfg: Config | None = None) -> Flask:
         app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
                           SESSION_COOKIE_SECURE=cfg.app_base_url.startswith("https://"))
     app.extensions["mjagent.cfg"] = cfg
+    # 静态资源版本号（每次进程启动变化）：企业微信等 WebView 会激进缓存 js/css，带上它强制取新版本
+    app.jinja_env.globals["asset_v"] = str(int(time.time()))
     store = SessionStore()
     app.extensions["mjagent.store"] = store
     flows = EmbedFlows()
