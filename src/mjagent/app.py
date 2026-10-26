@@ -32,7 +32,7 @@ from mjagent import wecom
 from mjagent.a2a_client import A2AClient, A2AError
 from mjagent.config import Config, load_config
 from mjagent.embed import FLOW_COOKIE, SESSION_HEADER, EmbedFlows, origin_of
-from mjagent.pingone import PingOneClient, PingOneError, pkce_pair
+from mjagent.pingone import IdpExchangeError, PingOneClient, PingOneError, pkce_pair
 from mjagent.scutum_client import ScutumClient, ScutumError
 from mjagent.store import SessionStore, UserSession
 
@@ -47,9 +47,9 @@ class LoginRequired(Exception):
 
 
 class ExchangeFailed(Exception):
-    """登录态有效但 Scutum 拒绝交换：重新登录解决不了（会无限跳转），直接把原因交给前端。"""
+    """登录态有效但 IdP / Scutum 拒绝交换：重新登录解决不了（会无限跳转），直接把原因交给前端。"""
 
-    def __init__(self, err: ScutumError):
+    def __init__(self, err: ScutumError | IdpExchangeError):
         super().__init__(str(err))
         self.error = err.error
         self.description = err.description
@@ -119,14 +119,34 @@ def create_app(cfg: Config | None = None) -> Flask:
                            id_token_claims=claims, pingone_access_token=tok.get("access_token"),
                            pingone_id_token=tok["id_token"], pingone_expires_at=time.time() + int(tok.get("expires_in", 3600)))
         sess.log("login", idp="pingone", sub=claims["sub"], email=claims.get("email"), scope=tok.get("scope"))
-        kind = cfg.pingone_subject_token
         try:
-            sess.scutum = scutum("pingone").exchange_pingone(
-                sess.pingone_id_token if kind == "id_token" else sess.pingone_access_token or "", token_kind=kind)
+            subject, kind = scutum_subject(sess)
+            sess.scutum = scutum("pingone").exchange_pingone(subject, token_kind=kind)
             sess.log("token_exchange", idp="pingone", result="ok", subject_token=kind, expires_in=int(sess.scutum.expires_at - time.time()))
+        except IdpExchangeError:
+            pass   # scutum_subject 已记录
         except ScutumError as e:
             sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
         return sess
+
+    def scutum_subject(sess: UserSession) -> tuple[str, str]:
+        """交给 Scutum 的 subject token 与类型。
+
+        两段交换：先用登录 access_token 在 IdP（交换专用 client）换一张签给 Scutum 的 token；
+        否则登录拿到的 token 本身就签给 Scutum，直接交过去。
+        """
+        if not cfg.idp_exchange_enabled:
+            kind = cfg.pingone_subject_token
+            return (sess.pingone_id_token if kind == "id_token" else sess.pingone_access_token) or "", kind
+        try:
+            tok = pingone().token_exchange(sess.pingone_access_token or "", client_id=cfg.idp_exchange_client_id,
+                                           client_secret=cfg.idp_exchange_client_secret, scope=cfg.idp_exchange_scope)
+        except IdpExchangeError as e:
+            sess.log("idp_token_exchange", idp="pingone", result=e.error, detail=e.description)
+            raise
+        sess.idp_exchanged_token = tok["access_token"]
+        sess.log("idp_token_exchange", idp="pingone", result="ok", scope=tok.get("scope"), expires_in=tok.get("expires_in"))
+        return tok["access_token"], "access_token"
 
     def login_url_for(idp: str) -> str:
         return url_for("wecom_login") if idp == "wecom" else url_for("pingone_login")
@@ -136,12 +156,13 @@ def create_app(cfg: Config | None = None) -> Flask:
         if sess.scutum and not sess.scutum.expired:
             return sess.scutum.access_token
         if sess.idp == "pingone" and sess.pingone_access_token and time.time() < sess.pingone_expires_at - 30:
-            kind = cfg.pingone_subject_token
-            subject = sess.pingone_id_token if kind == "id_token" else sess.pingone_access_token
             try:
+                subject, kind = scutum_subject(sess)
                 sess.scutum = scutum("pingone").exchange_pingone(subject, token_kind=kind)
                 sess.log("token_exchange", idp="pingone", result="ok", reason="re-exchange")
                 return sess.scutum.access_token
+            except IdpExchangeError as e:
+                raise ExchangeFailed(e) from e
             except ScutumError as e:
                 sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
                 raise ExchangeFailed(e) from e
@@ -172,13 +193,19 @@ def create_app(cfg: Config | None = None) -> Flask:
         sess = current()
         if not sess:
             return redirect(url_for("index"))
+        two_stage = cfg.idp_exchange_enabled
         tokens = {
-            "PingOne id_token": _claims(sess.pingone_id_token),
-            "PingOne access_token（签给 Scutum）": _claims(sess.pingone_access_token),
+            "IdP id_token": _claims(sess.pingone_id_token),
+            ("IdP 登录 access_token（签给客户应用）" if two_stage else "PingOne access_token（签给 Scutum）"):
+                _claims(sess.pingone_access_token),
+            "IdP 交换出的 token（签给 Scutum）": _claims(sess.idp_exchanged_token),
             "Scutum access_token（签给 Lyra）": _claims(sess.scutum.access_token if sess.scutum else None),
         }
+        checks = []
+        if sess.idp == "pingone":
+            checks = _two_stage_checks(sess, cfg) if two_stage else _pingone_checks(sess)
         return render_template("debug.html", cfg=cfg, user=sess, tokens={k: v for k, v in tokens.items() if v},
-                               checks=_pingone_checks(sess) if sess.idp == "pingone" else [],
+                               checks=checks,
                                events=list(reversed(sess.events)))
 
     @app.get("/logout")
@@ -556,6 +583,24 @@ def _pingone_checks(sess: UserSession) -> list[tuple[bool, str]]:
                        "——aud 为 api.pingone.* 说明没拿到 Custom Resource 的 token"),
         (bool(at.get("email")), "access_token 带 email（Scutum 按它匹配 CRM 用户）——否则在 Custom Resource 的 Attributes 映射 email"),
         (bool(idt.get("email")), "id_token 带 email——否则在应用 Resources 勾选 openid 的 email、profile"),
+    ]
+
+
+def _two_stage_checks(sess: UserSession, cfg: Config) -> list[tuple[bool, str]]:
+    """两段交换自检：登录 token 不该带 A2A 权限；交换出的 token 要签给 Scutum、带 a2a.invoke 和 email。"""
+    at, xt = _claims(sess.pingone_access_token), _claims(sess.idp_exchanged_token)
+    login_scopes = set(str(at.get("scope", "")).split())
+    x_scopes = set(str(xt.get("scope", "")).split())
+    return [
+        (cfg.idp_exchange_scope not in login_scopes,
+         f"登录 access_token 不含 {cfg.idp_exchange_scope}（实际：{' '.join(sorted(login_scopes)) or '无'}）——登录 client 不应放行 A2A 权限"),
+        (bool(xt), "IdP token exchange 成功——失败原因见下方事件"),
+        (bool(xt) and at.get("aud") != xt.get("aud"),
+         f"交换出的 token 签给另一方（登录 aud={at.get('aud')}，交换后 aud={xt.get('aud')}）"),
+        (cfg.idp_exchange_scope in x_scopes, f"交换出的 token scope 含 {cfg.idp_exchange_scope}（实际：{' '.join(sorted(x_scopes)) or '无'}）"),
+        (xt.get("client_id") == cfg.idp_exchange_client_id,
+         f"交换出的 token client_id 是交换专用 client（实际：{xt.get('client_id')}）——Scutum 按它绑定应用"),
+        (bool(xt.get("email")), "交换出的 token 带 email——否则检查 Processor Policy 和交换上下文的映射"),
     ]
 
 

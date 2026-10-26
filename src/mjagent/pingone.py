@@ -19,8 +19,21 @@ import jwt
 _discovery_cache: dict[str, tuple[dict, float]] = {}
 
 
+GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+TT_ACCESS_TOKEN = "urn:ietf:params:oauth:token-type:access_token"
+
+
 class PingOneError(Exception):
     pass
+
+
+class IdpExchangeError(PingOneError):
+    """IdP 拒绝 token exchange（RFC 6749 §5.2 错误）；字段与 ScutumError 对齐，前端统一展示。"""
+
+    def __init__(self, error: str, description: str = ""):
+        super().__init__(f"{error}: {description}" if description else error)
+        self.error = error
+        self.description = description
 
 
 def pkce_pair() -> tuple[str, str]:
@@ -87,6 +100,24 @@ class PingOneClient:
             resp = c.post(self.discovery()["token_endpoint"], data=data, auth=(self.client_id, self.client_secret))
         if resp.status_code != 200:
             raise PingOneError(f"token endpoint HTTP {resp.status_code}: {resp.text[:300]}")
+        return resp.json()
+
+    def token_exchange(self, subject_token: str, *, client_id: str, client_secret: str, scope: str) -> dict:
+        """RFC 8693：用登录 access_token 在 IdP 换一张签给 Scutum 的 token（两段交换的第一段）。
+
+        用的是 IdP 上的交换专用 client，不是登录 client：登录 client 拿不到 A2A 权限。
+        """
+        data = {"grant_type": GRANT_TOKEN_EXCHANGE, "subject_token": subject_token,
+                "subject_token_type": TT_ACCESS_TOKEN, "scope": scope}
+        with self._http() as c:
+            resp = c.post(self.discovery()["token_endpoint"], data=data, auth=(client_id, client_secret))
+        if resp.status_code != 200:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            raise IdpExchangeError(body.get("error") or f"HTTP {resp.status_code}",
+                                   body.get("error_description") or resp.text[:300])
         return resp.json()
 
     def verify_id_token(self, id_token: str, nonce: str) -> dict:

@@ -53,10 +53,20 @@ class Config:
     # 宿主方（agentx.htltio.cn）：/embed-host 页面用 iframe 加载的地址
     embed_app_url: str = ""
 
+    # ---- 两段交换（ORI-159317）：登录 token 先在客户 IdP（如 PingFederate）换出签给 Scutum 的 token ----
+    # 配了交换专用 client 才启用；不配 = 登录 access_token 本身就签给 Scutum，直接交给 Scutum
+    idp_exchange_client_id: str = ""
+    idp_exchange_client_secret: str = ""
+    idp_exchange_scope: str = "a2a.invoke"
+
     @property
     def pingone_enabled(self) -> bool:
         # 不要求 Scutum client：PingOne 登录是客户应用自己的事，交换失败会在调试页 / 对话里提示
         return bool(self.pingone_issuer and self.pingone_client_id)
+
+    @property
+    def idp_exchange_enabled(self) -> bool:
+        return bool(self.idp_exchange_client_id and self.idp_exchange_client_secret)
 
     @property
     def wecom_enabled(self) -> bool:
@@ -88,4 +98,7 @@ def load_config() -> Config:
         embed_mode=_bool("EMBED_MODE", False),
         embed_frame_ancestors=_env("EMBED_FRAME_ANCESTORS"),
         embed_app_url=_env("EMBED_APP_URL"),
+        idp_exchange_client_id=_env("PINGONE_EXCHANGE_CLIENT_ID"),
+        idp_exchange_client_secret=_env("PINGONE_EXCHANGE_CLIENT_SECRET"),
+        idp_exchange_scope=_env("PINGONE_EXCHANGE_SCOPE", "a2a.invoke"),
     )

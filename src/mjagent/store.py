@@ -24,6 +24,7 @@ class UserSession:
     id_token_claims: dict = field(default_factory=dict)
     pingone_access_token: str | None = None    # 签给 Scutum 的 PingOne token（重新交换用）
     pingone_id_token: str | None = None
+    idp_exchanged_token: str | None = None     # 两段交换：IdP 换出的、签给 Scutum 的 token（调试页展示）
     pingone_expires_at: float = 0
     scutum: ScutumToken | None = None
     context_ids: dict[str, str] = field(default_factory=dict)   # agent → 当前会话 contextId

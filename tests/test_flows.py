@@ -1,5 +1,6 @@
 """端到端（全 mock）：PingOne / 企业微信登录 → Scutum Token Exchange → Lyra A2A。"""
 
+import dataclasses
 import json
 import time
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +23,8 @@ RESOURCE = "https://lyra.test/lyra/a2a"
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 JWK = {**json.loads(RSAAlgorithm.to_jwk(KEY.public_key())), "kid": "k1", "alg": "RS256", "use": "sig"}
 
+TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+
 CFG = Config(
     secret_key="test", app_base_url="https://mjagent.test", debug_page=True,
     pingone_issuer=ISS, pingone_client_id="p1-app", pingone_client_secret="p1-secret",
@@ -41,6 +44,7 @@ class World:
         self.nonce = ""
         self.scutum_ttl = 900
         self.scutum_error: dict | None = None
+        self.idp_exchange_error: dict | None = None
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         self.calls.append(req)
@@ -49,6 +53,11 @@ class World:
             return httpx.Response(200, json={"issuer": ISS, "authorization_endpoint": f"{ISS}/authorize",
                                              "token_endpoint": f"{ISS}/token", "jwks_uri": f"{ISS}/jwks",
                                              "end_session_endpoint": f"{ISS}/signoff"})
+        if url == f"{ISS}/token" and parse_qs(req.content.decode()).get("grant_type") == [TOKEN_EXCHANGE]:
+            if self.idp_exchange_error:
+                return httpx.Response(400, json=self.idp_exchange_error)
+            return httpx.Response(200, json={"access_token": "idp-at-for-scutum", "token_type": "Bearer",
+                                             "issued_token_type": TT_ACCESS_TOKEN, "expires_in": 300, "scope": "a2a.invoke"})
         if url == f"{ISS}/token":
             now = int(time.time())
             id_token = jwt.encode({"iss": ISS, "aud": "p1-app", "sub": "p1-alice", "email": "alice@contoso.com",
@@ -152,6 +161,61 @@ def test_pingone_exchange_failure_still_logs_in(client, world):
     # 登录态仍有效：不能再把用户送回登录页（会无限跳转），而是直接报交换失败原因
     r = client.get("/api/agents")
     assert r.status_code == 502 and r.json["error"] == "token_exchange_failed" and "subject could not be mapped" in r.json["message"]
+
+
+TWO_STAGE = dataclasses.replace(CFG, pingone_scopes="openid profile email",
+                                idp_exchange_client_id="xchg", idp_exchange_client_secret="xs")
+
+
+def _two_stage_client():
+    app = create_app(TWO_STAGE)
+    app.testing = True
+    return app.test_client()
+
+
+def _login_without_a2a_scope(client, world):
+    r = client.get("/auth/pingone/login")
+    q = parse_qs(urlparse(r.headers["Location"]).query)
+    assert q["scope"] == ["openid profile email"]   # 登录不再申请 A2A 权限
+    world.nonce = q["nonce"][0]
+    return client.get(f"/auth/pingone/callback?code=c1&state={q['state'][0]}")
+
+
+def test_two_stage_exchanges_at_idp_then_scutum(world):
+    client = _two_stage_client()
+    r = _login_without_a2a_scope(client, world)
+    assert r.headers["Location"].endswith("/chat")
+    idp_x = [c for c in world.calls if str(c.url) == f"{ISS}/token" and b"token-exchange" in c.content]
+    assert len(idp_x) == 1
+    form = parse_qs(idp_x[0].content.decode())
+    assert form["subject_token"] == ["pingone-at-for-scutum"] and form["subject_token_type"] == [TT_ACCESS_TOKEN]
+    assert form["scope"] == ["a2a.invoke"]
+    # 交换专用 client 认证，不是登录 client
+    assert idp_x[0].headers["authorization"] == httpx.BasicAuth("xchg", "xs")._auth_header
+    scutum_form = parse_qs(next(c for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token").content.decode())
+    assert scutum_form["subject_token"] == ["idp-at-for-scutum"]
+    assert client.get("/api/agents").status_code == 200
+    page = client.get("/debug").get_data(as_text=True)
+    assert "idp_token_exchange" in page and "IdP 交换出的 token（签给 Scutum）" in page
+
+
+def test_two_stage_reexchange_repeats_both_steps(world):
+    world.scutum_ttl = 10
+    client = _two_stage_client()
+    _login_without_a2a_scope(client, world)
+    assert client.get("/api/agents").status_code == 200
+    assert sum(1 for c in world.calls if str(c.url) == f"{ISS}/token" and b"token-exchange" in c.content) == 2
+    assert sum(1 for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token") == 2
+
+
+def test_two_stage_idp_refusal_is_reported(world):
+    world.idp_exchange_error = {"error": "invalid_scope", "error_description": "scope a2a.invoke not allowed"}
+    client = _two_stage_client()
+    r = _login_without_a2a_scope(client, world)
+    assert r.headers["Location"].endswith("/chat")
+    assert not any(str(c.url) == f"{SCUTUM}/oauth/token" for c in world.calls)
+    r = client.get("/api/agents")
+    assert r.status_code == 502 and "scope a2a.invoke not allowed" in r.json["message"]
 
 
 def test_scutum_non_oauth_error_keeps_reason(client, world):
