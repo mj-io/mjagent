@@ -9,10 +9,12 @@ import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 from jwt.algorithms import RSAAlgorithm
 
 from mjagent import wecom
 from mjagent.app import create_app
+from mjagent.assertion import CLIENT_ASSERTION_TYPE, GRANT_JWT_BEARER
 from mjagent.config import Config
 from mjagent.scutum_client import TT_ACCESS_TOKEN, TT_WECOM_CODE, ScutumClient, ScutumError
 
@@ -69,9 +71,10 @@ class World:
             if self.scutum_error:
                 return httpx.Response(400, json=self.scutum_error)
             form = parse_qs(req.content.decode())
-            body = {"access_token": f"lyra-token-for-{form['subject_token'][0]}", "token_type": "Bearer",
+            subject = "assertion" if form["grant_type"] == [GRANT_JWT_BEARER] else form["subject_token"][0]
+            body = {"access_token": f"lyra-token-for-{subject}", "token_type": "Bearer",
                     "issued_token_type": TT_ACCESS_TOKEN, "expires_in": self.scutum_ttl, "scope": "a2a:invoke"}
-            if form["subject_token_type"][0] == TT_WECOM_CODE:
+            if form.get("subject_token_type") == [TT_WECOM_CODE]:
                 body["idp_subject"] = "zhangsan"
             return httpx.Response(200, json=body)
         if url == f"{LYRA}/a2a/agents":
@@ -216,6 +219,65 @@ def test_two_stage_idp_refusal_is_reported(world):
     assert not any(str(c.url) == f"{SCUTUM}/oauth/token" for c in world.calls)
     r = client.get("/api/agents")
     assert r.status_code == 502 and "scope a2a.invoke not allowed" in r.json["message"]
+
+
+ASSERTION_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _assertion_client(tmp_path):
+    key_file = tmp_path / "scutum-assertion.pem"
+    key_file.write_bytes(ASSERTION_KEY.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    cfg = dataclasses.replace(CFG, scutum_assertion_client_id="agt-c", scutum_assertion_key_file=str(key_file),
+                              scutum_assertion_kid="c1", scutum_assertion_subject_map=json.dumps({"alice@contoso.com": "alice.crm"}))
+    app = create_app(cfg)
+    app.testing = True
+    return app.test_client()
+
+
+def _assertion_forms(world) -> list[dict]:
+    return [parse_qs(c.content.decode()) for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token"]
+
+
+def test_assertion_mode_signs_user_and_client_assertions(world, tmp_path):
+    client = _assertion_client(tmp_path)
+    r = _pingone_login(client, world)
+    assert r.headers["Location"].endswith("/chat")
+    req = next(c for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token")
+    assert "authorization" not in req.headers   # 不用 client_secret
+    form = parse_qs(req.content.decode())
+    assert form["grant_type"] == [GRANT_JWT_BEARER] and form["client_assertion_type"] == [CLIENT_ASSERTION_TYPE]
+    assert form["resource"] == [RESOURCE] and form["scope"] == ["a2a:invoke"]
+    pub, aud = ASSERTION_KEY.public_key(), f"{SCUTUM}/oauth/token"
+    user = jwt.decode(form["assertion"][0], pub, algorithms=["RS256"], audience=aud)
+    cli = jwt.decode(form["client_assertion"][0], pub, algorithms=["RS256"], audience=aud)
+    # 登录账号经客户侧对照表换成 CRM 映射字段值
+    assert user["iss"] == "agt-c" and user["sub"] == "alice.crm"
+    assert cli["iss"] == cli["sub"] == "agt-c" and user["jti"] != cli["jti"]
+    assert user["exp"] - user["iat"] <= 300
+    assert jwt.get_unverified_header(form["assertion"][0])["kid"] == "c1"
+    # 兜底模式不碰 IdP 的 token exchange
+    assert not any(str(c.url) == f"{ISS}/token" and b"token-exchange" in c.content for c in world.calls)
+    assert client.get("/api/agents").status_code == 200
+    assert "alice.crm" in client.get("/debug").get_data(as_text=True)
+
+
+def test_assertion_mode_signs_fresh_assertions_on_reexchange(world, tmp_path):
+    world.scutum_ttl = 10
+    client = _assertion_client(tmp_path)
+    _pingone_login(client, world)
+    assert client.get("/api/agents").status_code == 200
+    forms = _assertion_forms(world)
+    assert len(forms) == 2
+    jtis = {jwt.decode(f["assertion"][0], options={"verify_signature": False})["jti"] for f in forms}
+    assert len(jtis) == 2   # Scutum 的 jti 只能用一次，每次都现签
+
+
+def test_assertion_refusal_is_reported(world, tmp_path):
+    world.scutum_error = {"error": "invalid_grant", "error_description": "subject must match exactly one active CRM user"}
+    client = _assertion_client(tmp_path)
+    _pingone_login(client, world)
+    r = client.get("/api/agents")
+    assert r.status_code == 502 and "exactly one active CRM user" in r.json["message"]
 
 
 def test_scutum_non_oauth_error_keeps_reason(client, world):

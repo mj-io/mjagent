@@ -30,10 +30,11 @@ from flask import (
 
 from mjagent import wecom
 from mjagent.a2a_client import A2AClient, A2AError
+from mjagent.assertion import AssertionSigner
 from mjagent.config import Config, load_config
 from mjagent.embed import FLOW_COOKIE, SESSION_HEADER, EmbedFlows, origin_of
 from mjagent.pingone import IdpExchangeError, PingOneClient, PingOneError, pkce_pair
-from mjagent.scutum_client import ScutumClient, ScutumError
+from mjagent.scutum_client import ScutumClient, ScutumError, ScutumToken
 from mjagent.store import SessionStore, UserSession
 
 logger = logging.getLogger("mjagent")
@@ -120,14 +121,42 @@ def create_app(cfg: Config | None = None) -> Flask:
                            pingone_id_token=tok["id_token"], pingone_expires_at=time.time() + int(tok.get("expires_in", 3600)))
         sess.log("login", idp="pingone", sub=claims["sub"], email=claims.get("email"), scope=tok.get("scope"))
         try:
-            subject, kind = scutum_subject(sess)
-            sess.scutum = scutum("pingone").exchange_pingone(subject, token_kind=kind)
-            sess.log("token_exchange", idp="pingone", result="ok", subject_token=kind, expires_in=int(sess.scutum.expires_at - time.time()))
+            sess.scutum = scutum_token_for(sess)
+            sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(),
+                     expires_in=int(sess.scutum.expires_at - time.time()))
         except IdpExchangeError:
             pass   # scutum_subject 已记录
         except ScutumError as e:
             sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
         return sess
+
+    def exchange_mode() -> str:
+        if cfg.assertion_enabled:
+            return "subject_field（私钥断言）"
+        return "idp_token（两段交换）" if cfg.idp_exchange_enabled else "idp_token"
+
+    signer_cache: dict[str, AssertionSigner] = {}
+
+    def assertion_signer() -> AssertionSigner:
+        if "s" not in signer_cache:
+            signer_cache["s"] = AssertionSigner.from_file(
+                cfg.scutum_assertion_client_id, cfg.scutum_assertion_key_file, kid=cfg.scutum_assertion_kid,
+                audience=f"{cfg.scutum_issuer}/oauth/token", alg=cfg.scutum_assertion_alg)
+        return signer_cache["s"]
+
+    def assertion_subject(sess: UserSession) -> str:
+        """断言里的 sub：登录用户的约定属性，经客户侧对照表换成 CRM 映射字段值（客户自己知道用户对应哪个 CRM 账号）。"""
+        login_value = str(sess.id_token_claims.get(cfg.scutum_assertion_subject_claim) or sess.email or sess.subject)
+        return cfg.assertion_subject_map.get(login_value, login_value)
+
+    def scutum_token_for(sess: UserSession) -> ScutumToken:
+        """PingOne / PF 登录用户的 Lyra token：配了兜底断言就用私钥签断言，否则 Token Exchange（单段或两段）。"""
+        if cfg.assertion_enabled:
+            subject = assertion_subject(sess)
+            sess.log("assertion", client_id=cfg.scutum_assertion_client_id, sub=subject, kid=cfg.scutum_assertion_kid)
+            return scutum("pingone").exchange_assertion(assertion_signer(), subject)
+        subject, kind = scutum_subject(sess)
+        return scutum("pingone").exchange_pingone(subject, token_kind=kind)
 
     def scutum_subject(sess: UserSession) -> tuple[str, str]:
         """交给 Scutum 的 subject token 与类型。
@@ -157,9 +186,8 @@ def create_app(cfg: Config | None = None) -> Flask:
             return sess.scutum.access_token
         if sess.idp == "pingone" and sess.pingone_access_token and time.time() < sess.pingone_expires_at - 30:
             try:
-                subject, kind = scutum_subject(sess)
-                sess.scutum = scutum("pingone").exchange_pingone(subject, token_kind=kind)
-                sess.log("token_exchange", idp="pingone", result="ok", reason="re-exchange")
+                sess.scutum = scutum_token_for(sess)
+                sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(), reason="re-exchange")
                 return sess.scutum.access_token
             except IdpExchangeError as e:
                 raise ExchangeFailed(e) from e
@@ -202,7 +230,9 @@ def create_app(cfg: Config | None = None) -> Flask:
             "Scutum access_token（签给 Lyra）": _claims(sess.scutum.access_token if sess.scutum else None),
         }
         checks = []
-        if sess.idp == "pingone":
+        if sess.idp == "pingone" and cfg.assertion_enabled:
+            checks = _assertion_checks(sess, cfg)
+        elif sess.idp == "pingone":
             checks = _two_stage_checks(sess, cfg) if two_stage else _pingone_checks(sess)
         return render_template("debug.html", cfg=cfg, user=sess, tokens={k: v for k, v in tokens.items() if v},
                                checks=checks,
@@ -601,6 +631,19 @@ def _two_stage_checks(sess: UserSession, cfg: Config) -> list[tuple[bool, str]]:
         (xt.get("client_id") == cfg.idp_exchange_client_id,
          f"交换出的 token client_id 是交换专用 client（实际：{xt.get('client_id')}）——Scutum 按它绑定应用"),
         (bool(xt.get("email")), "交换出的 token 带 email——否则检查 Processor Policy 和交换上下文的映射"),
+    ]
+
+
+def _assertion_checks(sess: UserSession, cfg: Config) -> list[tuple[bool, str]]:
+    """兜底断言自检：断言 sub 要能映射到 CRM 用户；Scutum token 由断言 client 换出、指向 CRM 用户。"""
+    st = _claims(sess.scutum.access_token if sess.scutum else None)
+    sub = next((e.get("sub") for e in reversed(sess.events) if e.get("kind") == "assertion"), None)
+    return [
+        (bool(sub), f"已用私钥签发用户断言（sub={sub}）——sub 须是与 Scutum 约定的 CRM 映射字段值"),
+        (bool(st), "Scutum 接受断言并签发 token——失败原因见下方事件"),
+        (st.get("azp") == cfg.scutum_assertion_client_id, f"Scutum token azp 是断言 client（实际：{st.get('azp')}）"),
+        (str(st.get("sub", "")).isdigit(), f"Scutum token sub 是 CRM 用户 id（实际：{st.get('sub')}）"),
+        (st.get("idp") == "assertion", f"Scutum token idp=assertion（实际：{st.get('idp')}）"),
     ]
 
 

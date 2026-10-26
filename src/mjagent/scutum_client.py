@@ -14,6 +14,7 @@ subject_token 取值：
   就是签给 Scutum 的，原样交过去（subject_token_type=urn:ietf:params:oauth:token-type:access_token）
 - 企业微信：企微 OAuth 回调里的 code **不要自己换**，直接交给 Scutum（subject_token_type=urn:veeva:params:oauth:token-type:wecom-code），
   响应里的 idp_subject 就是企微 userid，用它建立本应用自己的登录态
+- 兜底模式（客户 IdP 做不了服务端交换）：不走 token-exchange，改用私钥签断言，见 assertion.py / exchange_assertion
 
 没有 refresh_token：token 过期（expires_in，默认 ≤ 15 分钟）后重新交换。
 """
@@ -24,6 +25,8 @@ import time
 from dataclasses import dataclass
 
 import httpx
+
+from mjagent.assertion import CLIENT_ASSERTION_TYPE, GRANT_JWT_BEARER, AssertionSigner
 
 GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
 TT_ACCESS_TOKEN = "urn:ietf:params:oauth:token-type:access_token"
@@ -66,17 +69,29 @@ class ScutumClient:
         self._transport = transport
 
     def exchange(self, subject_token: str, subject_token_type: str) -> ScutumToken:
-        data = {
+        return self._token({
             "grant_type": GRANT_TOKEN_EXCHANGE,
             "subject_token": subject_token,
             "subject_token_type": subject_token_type,
             "requested_token_type": TT_ACCESS_TOKEN,
             "resource": self.resource,
             "scope": self.scope,
-        }
+        }, auth=(self.client_id, self.client_secret))
+
+    def exchange_assertion(self, signer: AssertionSigner, subject: str) -> ScutumToken:
+        """兜底模式：私钥签的用户断言（jwt-bearer grant）+ private_key_jwt 客户端认证，不用 client_secret。"""
+        return self._token({
+            "grant_type": GRANT_JWT_BEARER,
+            "assertion": signer.user_assertion(subject),
+            "client_assertion_type": CLIENT_ASSERTION_TYPE,
+            "client_assertion": signer.client_assertion(),
+            "resource": self.resource,
+            "scope": self.scope,
+        }, auth=None)
+
+    def _token(self, data: dict, *, auth: tuple[str, str] | None) -> ScutumToken:
         with httpx.Client(timeout=15.0, verify=self._verify, transport=self._transport) as c:
-            resp = c.post(self.token_endpoint, data=data, auth=(self.client_id, self.client_secret),
-                          headers={"Accept": "application/json"})
+            resp = c.post(self.token_endpoint, data=data, auth=auth, headers={"Accept": "application/json"})
         try:
             body = resp.json()
         except ValueError:

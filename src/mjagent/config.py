@@ -1,5 +1,6 @@
 """配置：全部来自环境变量（.env）。见 .env.example。"""
 
+import json
 import os
 from dataclasses import dataclass
 
@@ -59,6 +60,17 @@ class Config:
     idp_exchange_client_secret: str = ""
     idp_exchange_scope: str = "a2a.invoke"
 
+    # ---- 兜底模式（ORI-159317 方案 C，Scutum exchange_mode=subject_field）----
+    # 客户后端用自己的私钥签用户断言（RFC 7523），客户 IdP 不参与；配了 client 和私钥才启用，优先于 Token Exchange
+    scutum_assertion_client_id: str = ""
+    scutum_assertion_key_file: str = ""         # PEM 私钥路径，只放在客户后端；公钥（JWKS）登记在 Scutum
+    scutum_assertion_kid: str = ""
+    scutum_assertion_alg: str = "RS256"         # RS256 | ES256
+    # 断言 sub = 登录用户的这个属性（id_token claim），再经下面的对照表换成与 Scutum 约定的 CRM 映射字段值
+    scutum_assertion_subject_claim: str = "email"
+    # JSON：{"登录账号": "CRM 映射字段值"}，演示「客户自己知道用户对应哪个 CRM 账号」；没配就原样断言
+    scutum_assertion_subject_map: str = ""
+
     @property
     def pingone_enabled(self) -> bool:
         # 不要求 Scutum client：PingOne 登录是客户应用自己的事，交换失败会在调试页 / 对话里提示
@@ -67,6 +79,14 @@ class Config:
     @property
     def idp_exchange_enabled(self) -> bool:
         return bool(self.idp_exchange_client_id and self.idp_exchange_client_secret)
+
+    @property
+    def assertion_enabled(self) -> bool:
+        return bool(self.scutum_assertion_client_id and self.scutum_assertion_key_file)
+
+    @property
+    def assertion_subject_map(self) -> dict[str, str]:
+        return json.loads(self.scutum_assertion_subject_map) if self.scutum_assertion_subject_map else {}
 
     @property
     def wecom_enabled(self) -> bool:
@@ -101,4 +121,10 @@ def load_config() -> Config:
         idp_exchange_client_id=_env("PINGONE_EXCHANGE_CLIENT_ID"),
         idp_exchange_client_secret=_env("PINGONE_EXCHANGE_CLIENT_SECRET"),
         idp_exchange_scope=_env("PINGONE_EXCHANGE_SCOPE", "a2a.invoke"),
+        scutum_assertion_client_id=_env("SCUTUM_ASSERTION_CLIENT_ID"),
+        scutum_assertion_key_file=_env("SCUTUM_ASSERTION_KEY_FILE"),
+        scutum_assertion_kid=_env("SCUTUM_ASSERTION_KID"),
+        scutum_assertion_alg=_env("SCUTUM_ASSERTION_ALG", "RS256"),
+        scutum_assertion_subject_claim=_env("SCUTUM_ASSERTION_SUBJECT_CLAIM", "email"),
+        scutum_assertion_subject_map=_env("SCUTUM_ASSERTION_SUBJECT_MAP"),
     )
