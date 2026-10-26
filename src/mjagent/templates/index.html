@@ -11,10 +11,22 @@
     {% if cfg.wecom_enabled %}
     <a class="btn js-login" href="{{ url_for('wecom_login') }}" data-busy="正在跳转企业微信…">使用企业微信登录</a>
     {% endif %}
-    {% if not cfg.pingone_enabled and not cfg.wecom_enabled %}
-    <div class="alert">未配置任何登录方式：请在 .env 中配置 PINGONE_* 或 WECOM_*，以及对应的 SCUTUM_*_CLIENT_ID。</div>
+    {% if not cfg.pingone_enabled and not cfg.wecom_enabled and not cfg.local_login_enabled %}
+    <div class="alert">未配置任何登录方式：请在 .env 中配置 PINGONE_*、WECOM_* 或 LOCAL_USERS_FILE，以及对应的 Scutum client。</div>
     {% endif %}
   </div>
+  {% if cfg.local_login_enabled %}
+  <form class="local-login" method="post" action="{{ url_for('local_login') }}">
+    <div class="divider"><span>或使用本应用账号</span></div>
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label for="username">账号</label>
+    <input id="username" name="username" autocomplete="username" required>
+    <label for="password">密码</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button class="btn" type="submit" data-busy="正在登录…">登录</button>
+    <p class="muted small">本应用自己的账号，不经过外部身份系统；调用 Agent 时由本应用用私钥签名向 Scutum 担保身份。</p>
+  </form>
+  {% endif %}
   <dl class="kv">
     <dt>Scutum</dt><dd>{{ cfg.scutum_issuer or '未配置' }}</dd>
     <dt>Lyra A2A</dt><dd>{{ cfg.lyra_resource or '未配置' }}</dd>
@@ -31,6 +43,16 @@
       a.textContent = a.dataset.busy;
     });
   });
+  // 本地账号表单：提交后按钮置为处理中，防重复提交
+  var form = document.querySelector("form.local-login");
+  if (form) {
+    form.addEventListener("submit", function (ev) {
+      var btn = form.querySelector("button");
+      if (btn.getAttribute("aria-busy") === "true") { ev.preventDefault(); return; }
+      btn.setAttribute("aria-busy", "true");
+      btn.textContent = btn.dataset.busy;
+    });
+  }
   // 从往返缓存返回时恢复按钮
   window.addEventListener("pageshow", function (e) { if (e.persisted) location.reload(); });
 </script>

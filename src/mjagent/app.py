@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import re
@@ -33,11 +34,16 @@ from mjagent.a2a_client import A2AClient, A2AError
 from mjagent.assertion import AssertionSigner
 from mjagent.config import Config, load_config
 from mjagent.embed import FLOW_COOKIE, SESSION_HEADER, EmbedFlows, origin_of
+from mjagent.local_users import LocalUsers
 from mjagent.pingone import IdpExchangeError, PingOneClient, PingOneError, pkce_pair
 from mjagent.scutum_client import ScutumClient, ScutumError, ScutumToken
 from mjagent.store import SessionStore, UserSession
 
 logger = logging.getLogger("mjagent")
+
+# 本地账号登录：同一账号 LOCKOUT_SECONDS 内失败 LOCKOUT_FAILURES 次即暂时锁定
+LOCKOUT_FAILURES = 5
+LOCKOUT_SECONDS = 300
 
 
 class LoginRequired(Exception):
@@ -122,7 +128,7 @@ def create_app(cfg: Config | None = None) -> Flask:
         sess.log("login", idp="pingone", sub=claims["sub"], email=claims.get("email"), scope=tok.get("scope"))
         try:
             sess.scutum = scutum_token_for(sess)
-            sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(),
+            sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(sess),
                      expires_in=int(sess.scutum.expires_at - time.time()))
         except IdpExchangeError:
             pass   # scutum_subject 已记录
@@ -130,8 +136,8 @@ def create_app(cfg: Config | None = None) -> Flask:
             sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
         return sess
 
-    def exchange_mode() -> str:
-        if cfg.assertion_enabled:
+    def exchange_mode(sess: UserSession) -> str:
+        if sess.idp == "local":
             return "subject_field（私钥断言）"
         return "idp_token（两段交换）" if cfg.idp_exchange_enabled else "idp_token"
 
@@ -144,15 +150,12 @@ def create_app(cfg: Config | None = None) -> Flask:
                 audience=f"{cfg.scutum_issuer}/oauth/token", alg=cfg.scutum_assertion_alg)
         return signer_cache["s"]
 
-    def assertion_subject(sess: UserSession) -> str:
-        """断言里的 sub：登录用户的约定属性，经客户侧对照表换成 CRM 映射字段值（客户自己知道用户对应哪个 CRM 账号）。"""
-        login_value = str(sess.id_token_claims.get(cfg.scutum_assertion_subject_claim) or sess.email or sess.subject)
-        return cfg.assertion_subject_map.get(login_value, login_value)
-
     def scutum_token_for(sess: UserSession) -> ScutumToken:
-        """PingOne / PF 登录用户的 Lyra token：配了兜底断言就用私钥签断言，否则 Token Exchange（单段或两段）。"""
-        if cfg.assertion_enabled:
-            subject = assertion_subject(sess)
+        """换 Lyra token，按登录方式选交换模式：本地账号用私钥签断言（兜底），PingOne / PF 用 Token Exchange（单段或两段）。"""
+        if sess.idp == "local":
+            if not cfg.assertion_enabled:
+                raise ScutumError("unauthorized_client", "本地账号需要兜底模式：请配置 SCUTUM_ASSERTION_CLIENT_ID / SCUTUM_ASSERTION_KEY_FILE")
+            subject = sess.crm_subject or sess.subject
             sess.log("assertion", client_id=cfg.scutum_assertion_client_id, sub=subject, kid=cfg.scutum_assertion_kid)
             return scutum("pingone").exchange_assertion(assertion_signer(), subject)
         subject, kind = scutum_subject(sess)
@@ -178,16 +181,27 @@ def create_app(cfg: Config | None = None) -> Flask:
         return tok["access_token"], "access_token"
 
     def login_url_for(idp: str) -> str:
+        if idp == "local":
+            return url_for("index")
         return url_for("wecom_login") if idp == "wecom" else url_for("pingone_login")
 
     def ensure_token(sess: UserSession) -> str:
         """拿一张有效的 Lyra token：未过期直接用；PingOne 用户在 PingOne token 有效期内静默重新交换；否则重新登录。"""
         if sess.scutum and not sess.scutum.expired:
             return sess.scutum.access_token
+        if sess.idp == "local":
+            # 本地会话有效期内随时可以现签断言再换，不依赖外部 IdP
+            try:
+                sess.scutum = scutum_token_for(sess)
+                sess.log("token_exchange", idp="local", result="ok", mode=exchange_mode(sess), reason="re-exchange")
+                return sess.scutum.access_token
+            except ScutumError as e:
+                sess.log("token_exchange", idp="local", result=e.error, detail=e.description)
+                raise ExchangeFailed(e) from e
         if sess.idp == "pingone" and sess.pingone_access_token and time.time() < sess.pingone_expires_at - 30:
             try:
                 sess.scutum = scutum_token_for(sess)
-                sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(), reason="re-exchange")
+                sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(sess), reason="re-exchange")
                 return sess.scutum.access_token
             except IdpExchangeError as e:
                 raise ExchangeFailed(e) from e
@@ -205,7 +219,48 @@ def create_app(cfg: Config | None = None) -> Flask:
             return redirect(url_for("chat"))
         if cfg.wecom_enabled and wecom.in_wecom(request.headers.get("User-Agent")):
             return redirect(url_for("wecom_login"))   # 企微内打开：直接静默授权
-        return render_template("index.html", cfg=cfg, error=request.args.get("error"))
+        csrf = None
+        if cfg.local_login_enabled:
+            csrf = session.setdefault("login_csrf", secrets.token_urlsafe(24))
+        return render_template("index.html", cfg=cfg, error=request.args.get("error"), csrf=csrf)
+
+    # ------------------------------------------------------------------ 本地账号（客户应用自己的账号体系）
+
+    login_failures: dict[str, list[float]] = {}   # 账号 → 最近失败时间；单进程部署，演示级限流
+
+    def locked_out(username: str) -> bool:
+        recent = [t for t in login_failures.get(username, []) if t > time.time() - LOCKOUT_SECONDS]
+        login_failures[username] = recent
+        return len(recent) >= LOCKOUT_FAILURES
+
+    @app.post("/auth/local/login")
+    def local_login():
+        if not cfg.local_login_enabled:
+            abort(404)
+        expected = session.get("login_csrf")
+        if not expected or not hmac.compare_digest(expected, request.form.get("csrf", "")):
+            return redirect(url_for("index", error="登录表单已过期，请重试"))
+        username = request.form.get("username", "").strip()
+        if locked_out(username):
+            return redirect(url_for("index", error=f"失败次数过多，请 {LOCKOUT_SECONDS // 60} 分钟后再试"))
+        user = LocalUsers(cfg.local_users_file).authenticate(username, request.form.get("password", ""))
+        if not user:
+            login_failures.setdefault(username, []).append(time.time())
+            logger.warning("local login failed user=%s", username)
+            return redirect(url_for("index", error="账号或密码错误"))
+        login_failures.pop(username, None)
+        store.drop(session.pop("sid", None))
+        session.pop("login_csrf", None)
+        sess = UserSession(idp="local", subject=user.username, display_name=user.name, crm_subject=user.crm_subject)
+        sess.log("login", idp="local", user=user.username, crm_subject=user.crm_subject)
+        try:
+            sess.scutum = scutum_token_for(sess)
+            sess.log("token_exchange", idp="local", result="ok", mode=exchange_mode(sess),
+                     expires_in=int(sess.scutum.expires_at - time.time()))
+        except ScutumError as e:
+            sess.log("token_exchange", idp="local", result=e.error, detail=e.description)
+        session["sid"] = store.put(sess)
+        return redirect(url_for("chat"))
 
     @app.get("/chat")
     def chat():
@@ -230,7 +285,7 @@ def create_app(cfg: Config | None = None) -> Flask:
             "Scutum access_token（签给 Lyra）": _claims(sess.scutum.access_token if sess.scutum else None),
         }
         checks = []
-        if sess.idp == "pingone" and cfg.assertion_enabled:
+        if sess.idp == "local":
             checks = _assertion_checks(sess, cfg)
         elif sess.idp == "pingone":
             checks = _two_stage_checks(sess, cfg) if two_stage else _pingone_checks(sess)

@@ -1,7 +1,8 @@
-"""端到端（全 mock）：PingOne / 企业微信登录 → Scutum Token Exchange → Lyra A2A。"""
+"""端到端（全 mock）：PingOne / 企业微信 / 本地账号登录 → Scutum（Token Exchange 或私钥断言）→ Lyra A2A。"""
 
 import dataclasses
 import json
+import re
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -16,6 +17,8 @@ from mjagent import wecom
 from mjagent.app import create_app
 from mjagent.assertion import CLIENT_ASSERTION_TYPE, GRANT_JWT_BEARER
 from mjagent.config import Config
+from mjagent.local_users import LocalUsers
+from mjagent.local_users import main as local_users_main
 from mjagent.scutum_client import TT_ACCESS_TOKEN, TT_WECOM_CODE, ScutumClient, ScutumError
 
 ISS = "https://auth.pingone.test/env-1/as"
@@ -224,23 +227,31 @@ def test_two_stage_idp_refusal_is_reported(world):
 ASSERTION_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
-def _assertion_client(tmp_path):
+def _local_client(tmp_path, *, assertion: bool = True):
+    users = LocalUsers(str(tmp_path / "users.json"))
+    users.upsert("alice", "correct horse", crm_subject="alice.crm", name="Alice")
     key_file = tmp_path / "scutum-assertion.pem"
     key_file.write_bytes(ASSERTION_KEY.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
-    cfg = dataclasses.replace(CFG, scutum_assertion_client_id="agt-c", scutum_assertion_key_file=str(key_file),
-                              scutum_assertion_kid="c1", scutum_assertion_subject_map=json.dumps({"alice@contoso.com": "alice.crm"}))
-    app = create_app(cfg)
+    extra = {"scutum_assertion_client_id": "agt-c", "scutum_assertion_key_file": str(key_file),
+             "scutum_assertion_kid": "c1"} if assertion else {}
+    app = create_app(dataclasses.replace(CFG, local_users_file=str(users.path), **extra))
     app.testing = True
     return app.test_client()
 
 
-def _assertion_forms(world) -> list[dict]:
+def _local_login(client, username="alice", password="correct horse", csrf=None):
+    page = client.get("/").get_data(as_text=True)
+    token = csrf if csrf is not None else re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+    return client.post("/auth/local/login", data={"csrf": token, "username": username, "password": password})
+
+
+def _scutum_forms(world) -> list[dict]:
     return [parse_qs(c.content.decode()) for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token"]
 
 
-def test_assertion_mode_signs_user_and_client_assertions(world, tmp_path):
-    client = _assertion_client(tmp_path)
-    r = _pingone_login(client, world)
+def test_local_login_signs_user_and_client_assertions(world, tmp_path):
+    client = _local_client(tmp_path)
+    r = _local_login(client)
     assert r.headers["Location"].endswith("/chat")
     req = next(c for c in world.calls if str(c.url) == f"{SCUTUM}/oauth/token")
     assert "authorization" not in req.headers   # 不用 client_secret
@@ -250,34 +261,74 @@ def test_assertion_mode_signs_user_and_client_assertions(world, tmp_path):
     pub, aud = ASSERTION_KEY.public_key(), f"{SCUTUM}/oauth/token"
     user = jwt.decode(form["assertion"][0], pub, algorithms=["RS256"], audience=aud)
     cli = jwt.decode(form["client_assertion"][0], pub, algorithms=["RS256"], audience=aud)
-    # 登录账号经客户侧对照表换成 CRM 映射字段值
+    # 断言 sub 是账号登记的 CRM 映射字段值，不是本地账号名
     assert user["iss"] == "agt-c" and user["sub"] == "alice.crm"
     assert cli["iss"] == cli["sub"] == "agt-c" and user["jti"] != cli["jti"]
     assert user["exp"] - user["iat"] <= 300
     assert jwt.get_unverified_header(form["assertion"][0])["kid"] == "c1"
-    # 兜底模式不碰 IdP 的 token exchange
-    assert not any(str(c.url) == f"{ISS}/token" and b"token-exchange" in c.content for c in world.calls)
+    # 本地账号不经过任何 IdP
+    assert not any(str(c.url).startswith(ISS) for c in world.calls)
     assert client.get("/api/agents").status_code == 200
-    assert "alice.crm" in client.get("/debug").get_data(as_text=True)
+    page = client.get("/debug").get_data(as_text=True)
+    assert "alice.crm" in page and "本应用账号" in page
 
 
-def test_assertion_mode_signs_fresh_assertions_on_reexchange(world, tmp_path):
+def test_local_login_signs_fresh_assertions_on_reexchange(world, tmp_path):
     world.scutum_ttl = 10
-    client = _assertion_client(tmp_path)
-    _pingone_login(client, world)
+    client = _local_client(tmp_path)
+    _local_login(client)
     assert client.get("/api/agents").status_code == 200
-    forms = _assertion_forms(world)
+    forms = _scutum_forms(world)
     assert len(forms) == 2
     jtis = {jwt.decode(f["assertion"][0], options={"verify_signature": False})["jti"] for f in forms}
     assert len(jtis) == 2   # Scutum 的 jti 只能用一次，每次都现签
 
 
+def test_local_login_rejects_bad_password_csrf_and_locks_out(world, tmp_path):
+    client = _local_client(tmp_path)
+    r = _local_login(client, password="wrong pass")
+    assert "error=" in r.headers["Location"] and client.get("/chat").status_code == 302
+    r = _local_login(client, username="nobody", password="whatever!")
+    assert "error=" in r.headers["Location"]
+    r = _local_login(client, csrf="forged")
+    assert "error=" in r.headers["Location"] and not _scutum_forms(world)
+    for _ in range(4):
+        _local_login(client, password="wrong pass")
+    # 已失败 5 次：正确密码也暂时拒绝
+    r = _local_login(client)
+    assert "error=" in r.headers["Location"] and not _scutum_forms(world)
+
+
+def test_pingone_session_keeps_token_exchange_when_assertion_configured(world, tmp_path):
+    client = _local_client(tmp_path)
+    _pingone_login(client, world)
+    form = _scutum_forms(world)[0]
+    assert form["grant_type"] == [TOKEN_EXCHANGE] and form["subject_token"] == ["pingone-at-for-scutum"]
+
+
+def test_local_login_without_assertion_config_reports_reason(world, tmp_path):
+    client = _local_client(tmp_path, assertion=False)
+    _local_login(client)
+    r = client.get("/api/agents")
+    assert r.status_code == 502 and "SCUTUM_ASSERTION_CLIENT_ID" in r.json["message"]
+
+
 def test_assertion_refusal_is_reported(world, tmp_path):
     world.scutum_error = {"error": "invalid_grant", "error_description": "subject must match exactly one active CRM user"}
-    client = _assertion_client(tmp_path)
-    _pingone_login(client, world)
+    client = _local_client(tmp_path)
+    _local_login(client)
     r = client.get("/api/agents")
     assert r.status_code == 502 and "exactly one active CRM user" in r.json["message"]
+
+
+def test_local_users_cli_stores_hash_with_private_permissions(tmp_path, monkeypatch):
+    path = tmp_path / "users.json"
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "s3cret-pass")
+    assert local_users_main(["add", "bob", "--crm-subject", "bob@crm", "--file", str(path)]) == 0
+    data = json.loads(path.read_text())
+    assert data["bob"]["crm_subject"] == "bob@crm" and "s3cret-pass" not in path.read_text()
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert LocalUsers(str(path)).authenticate("bob", "s3cret-pass").crm_subject == "bob@crm"
 
 
 def test_scutum_non_oauth_error_keeps_reason(client, world):

@@ -11,7 +11,7 @@
     <a class="brand" href="{{ url_for('index') }}">MJ Agent <span class="tag">客户 agent 应用 demo</span></a>
     {% if user %}
     <nav>
-      <span class="who" title="{{ user.idp }}:{{ user.subject }}">{{ user.display_name }} · {{ 'PingOne' if user.idp == 'pingone' else '企业微信' }}</span>
+      <span class="who" title="{{ user.idp }}:{{ user.subject }}">{{ user.display_name }} · {{ {'pingone': 'PingOne', 'wecom': '企业微信', 'local': '本应用账号'}.get(user.idp, user.idp) }}</span>
       {% if cfg.debug_page %}<a href="{{ url_for('debug') }}">调试</a>{% endif %}
       <a href="{{ url_for('logout') }}">退出</a>
       {% if user.idp == 'pingone' %}<a href="{{ url_for('pingone_logout') }}" title="同时清掉 PingOne 的登录会话，下次登录可换账号">登出 PingOne</a>{% endif %}

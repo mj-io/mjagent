@@ -30,6 +30,14 @@ h1 { font-size: 20px; margin: 0 0 8px; } h2 { font-size: 15px; margin: 20px 0 8p
 .btn:disabled { opacity: .5; cursor: default; }
 .alert { white-space: pre-wrap; background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger);
          border-radius: 8px; padding: 10px 12px; margin: 8px 0; font-size: 14px; }
+.local-login { display: flex; flex-direction: column; gap: 6px; margin: 0 0 18px; }
+.local-login label { font-size: 13px; color: var(--muted); }
+.local-login input { padding: 9px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); font-size: 15px; }
+.local-login input:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+.local-login .btn { margin-top: 8px; }
+.divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; margin: 0 0 6px; }
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.small { font-size: 12px; margin: 4px 0 0; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; color: var(--muted); margin: 0; }
 .kv dd { margin: 0; word-break: break-all; }
 .chat { flex: 1; display: flex; flex-direction: column; min-height: 0; gap: 10px; }
