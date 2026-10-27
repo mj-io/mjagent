@@ -17,7 +17,7 @@ _TTL_SECONDS = 8 * 3600
 
 @dataclass
 class UserSession:
-    idp: str                                   # pingone | entra | wecom | local
+    idp: str                                   # pingone | p1 | entra | wecom | local
     subject: str                               # PingOne sub / 企微 userid / 本地账号名
     display_name: str = ""
     email: str | None = None

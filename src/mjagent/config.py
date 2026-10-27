@@ -80,6 +80,20 @@ class Config:
     scutum_entra_client_id: str = ""            # Scutum 上 idp_token 模式、身份源为 Entra 的集成应用
     scutum_entra_client_secret: str = ""
 
+    # ---- PingOne 登录 + PingOne Token Exchange（ORI-158433）----
+    # 与上面的 PINGONE_* 槽位独立（那个槽位目前接的是 PingFederate）。登录只拿签给本应用的 token，
+    # 调 A2A 前用同一个应用（开了 Token Exchange 授权）在 PingOne 换出签给 Scutum 的 token
+    p1_issuer: str = ""                         # https://auth.pingone.{com|eu|asia|sg}/<envId>/as
+    p1_client_id: str = ""
+    p1_client_secret: str = ""
+    p1_scopes: str = "openid profile email offline_access"   # 不含 a2a.invoke：登录 token 不带 A2A 权限
+    p1_exchange_scope: str = "a2a.invoke"       # Scutum custom resource 的 scope
+    scutum_p1_client_id: str = ""               # Scutum 上 idp_token 模式、身份源为 PingOne 的集成应用
+    scutum_p1_client_secret: str = ""
+
+    # 登录页按钮上 PINGONE_* 槽位的厂商名（接 PingFederate 时配 PingFederate）
+    pingone_label: str = "PingOne"
+
     # ---- 本地账号登录（客户应用自己的账号体系，见 local_users.py）----
     local_users_file: str = ""
 
@@ -98,6 +112,10 @@ class Config:
     @property
     def entra_enabled(self) -> bool:
         return bool(self.entra_tenant_id and self.entra_client_id and self.entra_client_secret and self.entra_obo_scope)
+
+    @property
+    def p1_enabled(self) -> bool:
+        return bool(self.p1_issuer and self.p1_client_id and self.p1_client_secret)
 
     @property
     def idp_exchange_enabled(self) -> bool:
@@ -152,6 +170,14 @@ def load_config() -> Config:
         entra_obo_scope=_env("ENTRA_OBO_SCOPE"),
         scutum_entra_client_id=_env("SCUTUM_ENTRA_CLIENT_ID"),
         scutum_entra_client_secret=_secret("SCUTUM_ENTRA_CLIENT_SECRET"),
+        p1_issuer=_env("P1_ISSUER").rstrip("/"),
+        p1_client_id=_env("P1_CLIENT_ID"),
+        p1_client_secret=_secret("P1_CLIENT_SECRET"),
+        p1_scopes=_env("P1_SCOPES", "openid profile email offline_access"),
+        p1_exchange_scope=_env("P1_EXCHANGE_SCOPE", "a2a.invoke"),
+        scutum_p1_client_id=_env("SCUTUM_P1_CLIENT_ID"),
+        scutum_p1_client_secret=_secret("SCUTUM_P1_CLIENT_SECRET"),
+        pingone_label=_env("PINGONE_LABEL", "PingOne"),
         local_users_file=_env("LOCAL_USERS_FILE"),
         scutum_assertion_client_id=_env("SCUTUM_ASSERTION_CLIENT_ID"),
         scutum_assertion_key_file=_env("SCUTUM_ASSERTION_KEY_FILE"),

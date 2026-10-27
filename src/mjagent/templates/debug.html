@@ -5,7 +5,7 @@
   <h1>令牌与调用记录</h1>
   <p class="muted">只解码不验签，仅用于联调排查。生产环境请设置 DEBUG_PAGE=false。</p>
   {% if checks %}
-  <h2>{{ {'entra': 'Entra OBO 配置自检', 'local': '私钥断言配置自检'}.get(user.idp, 'PingOne 配置自检') }}</h2>
+  <h2>{{ {'entra': 'Entra OBO 配置自检', 'p1': 'PingOne Token Exchange 配置自检', 'local': '私钥断言配置自检'}.get(user.idp, 'PingOne 配置自检') }}</h2>
   <ul class="checks">
     {% for ok, text in checks %}<li class="{{ 'ok' if ok else 'bad' }}">{{ '✓' if ok else '✗' }} {{ text }}</li>{% endfor %}
   </ul>
