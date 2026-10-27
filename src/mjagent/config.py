@@ -10,6 +10,16 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+def _secret(name: str) -> str:
+    """secret 可直接配在 NAME，也可放在单独文件里（NAME_FILE，权限 600），后者不进 .env。"""
+    value = _env(name)
+    path = _env(f"{name}_FILE")
+    if not value and path and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            value = f.read().strip()
+    return value
+
+
 def _bool(name: str, default: bool = False) -> bool:
     v = _env(name)
     return default if not v else v.lower() in ("1", "true", "yes", "on")
@@ -59,6 +69,17 @@ class Config:
     idp_exchange_client_secret: str = ""
     idp_exchange_scope: str = "a2a.invoke"
 
+    # ---- Microsoft Entra ID 登录 + OBO（ORI-158433，见 entra.py）----
+    entra_tenant_id: str = ""
+    entra_client_id: str = ""                   # 本应用在 Entra 的 client id
+    entra_client_secret: str = ""
+    # 登录 scope：必须带本应用自己公开的 API（api://<client id>/access_as_user），access_token 才签给本应用
+    entra_scopes: str = ""
+    # OBO 目标：Scutum 在客户 Entra 注册的 API 应用的 scope，如 api://<API 应用 client id>/a2a.invoke
+    entra_obo_scope: str = ""
+    scutum_entra_client_id: str = ""            # Scutum 上 idp_token 模式、身份源为 Entra 的集成应用
+    scutum_entra_client_secret: str = ""
+
     # ---- 本地账号登录（客户应用自己的账号体系，见 local_users.py）----
     local_users_file: str = ""
 
@@ -73,6 +94,10 @@ class Config:
     def pingone_enabled(self) -> bool:
         # 不要求 Scutum client：PingOne 登录是客户应用自己的事，交换失败会在调试页 / 对话里提示
         return bool(self.pingone_issuer and self.pingone_client_id)
+
+    @property
+    def entra_enabled(self) -> bool:
+        return bool(self.entra_tenant_id and self.entra_client_id and self.entra_client_secret and self.entra_obo_scope)
 
     @property
     def idp_exchange_enabled(self) -> bool:
@@ -119,6 +144,14 @@ def load_config() -> Config:
         idp_exchange_client_id=_env("PINGONE_EXCHANGE_CLIENT_ID"),
         idp_exchange_client_secret=_env("PINGONE_EXCHANGE_CLIENT_SECRET"),
         idp_exchange_scope=_env("PINGONE_EXCHANGE_SCOPE", "a2a.invoke"),
+        entra_tenant_id=_env("ENTRA_TENANT_ID"),
+        entra_client_id=_env("ENTRA_CLIENT_ID"),
+        entra_client_secret=_secret("ENTRA_CLIENT_SECRET"),
+        entra_scopes=_env("ENTRA_SCOPES") or (
+            f"openid profile email offline_access api://{_env('ENTRA_CLIENT_ID')}/access_as_user" if _env("ENTRA_CLIENT_ID") else ""),
+        entra_obo_scope=_env("ENTRA_OBO_SCOPE"),
+        scutum_entra_client_id=_env("SCUTUM_ENTRA_CLIENT_ID"),
+        scutum_entra_client_secret=_secret("SCUTUM_ENTRA_CLIENT_SECRET"),
         local_users_file=_env("LOCAL_USERS_FILE"),
         scutum_assertion_client_id=_env("SCUTUM_ASSERTION_CLIENT_ID"),
         scutum_assertion_key_file=_env("SCUTUM_ASSERTION_KEY_FILE"),

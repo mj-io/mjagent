@@ -17,14 +17,14 @@ _TTL_SECONDS = 8 * 3600
 
 @dataclass
 class UserSession:
-    idp: str                                   # pingone | wecom | local
+    idp: str                                   # pingone | entra | wecom | local
     subject: str                               # PingOne sub / 企微 userid / 本地账号名
     display_name: str = ""
     email: str | None = None
     id_token_claims: dict = field(default_factory=dict)
-    pingone_access_token: str | None = None    # 签给 Scutum 的 PingOne token（重新交换用）
+    pingone_access_token: str | None = None    # OIDC IdP（PingOne / PF / Entra）登录拿到的 access_token（重新交换用）
     pingone_id_token: str | None = None
-    idp_exchanged_token: str | None = None     # 两段交换：IdP 换出的、签给 Scutum 的 token（调试页展示）
+    idp_exchanged_token: str | None = None     # 两段交换 / Entra OBO：IdP 换出的、签给 Scutum 的 token（调试页展示）
     crm_subject: str | None = None             # 本地账号：在 CRM 对应的映射字段值，兜底断言的 sub
     pingone_expires_at: float = 0
     scutum: ScutumToken | None = None

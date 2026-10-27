@@ -34,6 +34,7 @@ from mjagent.a2a_client import A2AClient, A2AError
 from mjagent.assertion import AssertionSigner
 from mjagent.config import Config, load_config
 from mjagent.embed import FLOW_COOKIE, SESSION_HEADER, EmbedFlows, origin_of
+from mjagent.entra import EntraClient
 from mjagent.local_users import LocalUsers
 from mjagent.pingone import IdpExchangeError, PingOneClient, PingOneError, pkce_pair
 from mjagent.scutum_client import ScutumClient, ScutumError, ScutumToken
@@ -96,9 +97,16 @@ def create_app(cfg: Config | None = None) -> Flask:
         return PingOneClient(cfg.pingone_issuer, cfg.pingone_client_id, cfg.pingone_client_secret, cfg.pingone_scopes,
                              f"{cfg.app_base_url}{callback_path}", verify=cfg.http_verify)
 
+    def entra() -> EntraClient:
+        return EntraClient(cfg.entra_tenant_id, cfg.entra_client_id, cfg.entra_client_secret, cfg.entra_scopes,
+                           f"{cfg.app_base_url}/auth/entra/callback", verify=cfg.http_verify)
+
     def scutum(idp: str) -> ScutumClient:
         if idp == "wecom":
             return ScutumClient(cfg.scutum_issuer, cfg.scutum_wecom_client_id, cfg.scutum_wecom_client_secret,
+                                resource=cfg.lyra_resource, verify=cfg.http_verify)
+        if idp == "entra":
+            return ScutumClient(cfg.scutum_issuer, cfg.scutum_entra_client_id, cfg.scutum_entra_client_secret,
                                 resource=cfg.lyra_resource, verify=cfg.http_verify)
         return ScutumClient(cfg.scutum_issuer, cfg.scutum_pingone_client_id, cfg.scutum_pingone_client_secret,
                             resource=cfg.lyra_resource, verify=cfg.http_verify)
@@ -117,28 +125,35 @@ def create_app(cfg: Config | None = None) -> Flask:
     def current() -> UserSession | None:
         return store.get(auth_channel()[0])
 
-    def complete_pingone_login(client: PingOneClient, code: str, verifier: str, nonce: str) -> UserSession:
-        """授权码 → PingOne token → 建立本应用会话 → Scutum 交换（失败不影响登录，聊天时再提示原因）。"""
+    def complete_pingone_login(client: PingOneClient, code: str, verifier: str, nonce: str,
+                               idp: str = "pingone") -> UserSession:
+        """授权码 → IdP token → 建立本应用会话 → Scutum 交换（失败不影响登录，聊天时再提示原因）。
+
+        PingOne / PingFederate / Entra 都是标准 OIDC，共用这一段；idp 决定后面怎么换 Scutum token。
+        """
         tok = client.exchange_code(code, verifier)
         claims = client.verify_id_token(tok["id_token"], nonce)
-        sess = UserSession(idp="pingone", subject=claims["sub"], email=claims.get("email"),
+        sess = UserSession(idp=idp, subject=claims["sub"], email=claims.get("email"),
                            display_name=claims.get("name") or claims.get("preferred_username") or claims.get("email") or claims["sub"],
                            id_token_claims=claims, pingone_access_token=tok.get("access_token"),
                            pingone_id_token=tok["id_token"], pingone_expires_at=time.time() + int(tok.get("expires_in", 3600)))
-        sess.log("login", idp="pingone", sub=claims["sub"], email=claims.get("email"), scope=tok.get("scope"))
+        sess.log("login", idp=idp, sub=claims["sub"], email=claims.get("email"),
+                 username=claims.get("preferred_username"), scope=tok.get("scope"))
         try:
             sess.scutum = scutum_token_for(sess)
-            sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(sess),
+            sess.log("token_exchange", idp=idp, result="ok", mode=exchange_mode(sess),
                      expires_in=int(sess.scutum.expires_at - time.time()))
         except IdpExchangeError:
             pass   # scutum_subject 已记录
         except ScutumError as e:
-            sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
+            sess.log("token_exchange", idp=idp, result=e.error, detail=e.description)
         return sess
 
     def exchange_mode(sess: UserSession) -> str:
         if sess.idp == "local":
             return "subject_field（私钥断言）"
+        if sess.idp == "entra":
+            return "idp_token（Entra OBO）"
         return "idp_token（两段交换）" if cfg.idp_exchange_enabled else "idp_token"
 
     signer_cache: dict[str, AssertionSigner] = {}
@@ -159,14 +174,24 @@ def create_app(cfg: Config | None = None) -> Flask:
             sess.log("assertion", client_id=cfg.scutum_assertion_client_id, sub=subject, kid=cfg.scutum_assertion_kid)
             return scutum("pingone").exchange_assertion(assertion_signer(), subject)
         subject, kind = scutum_subject(sess)
-        return scutum("pingone").exchange_pingone(subject, token_kind=kind)
+        return scutum(sess.idp).exchange_pingone(subject, token_kind=kind)
 
     def scutum_subject(sess: UserSession) -> tuple[str, str]:
         """交给 Scutum 的 subject token 与类型。
 
         两段交换：先用登录 access_token 在 IdP（交换专用 client）换一张签给 Scutum 的 token；
+        Entra：Entra 不支持 RFC 8693，第一段用 OBO 换出签给 Scutum API 应用的 token；
         否则登录拿到的 token 本身就签给 Scutum，直接交过去。
         """
+        if sess.idp == "entra":
+            try:
+                tok = entra().on_behalf_of(sess.pingone_access_token or "", cfg.entra_obo_scope)
+            except IdpExchangeError as e:
+                sess.log("obo", idp="entra", result=e.error, detail=e.description)
+                raise
+            sess.idp_exchanged_token = tok["access_token"]
+            sess.log("obo", idp="entra", result="ok", scope=tok.get("scope"), expires_in=tok.get("expires_in"))
+            return tok["access_token"], "access_token"
         if not cfg.idp_exchange_enabled:
             kind = cfg.pingone_subject_token
             return (sess.pingone_id_token if kind == "id_token" else sess.pingone_access_token) or "", kind
@@ -183,6 +208,8 @@ def create_app(cfg: Config | None = None) -> Flask:
     def login_url_for(idp: str) -> str:
         if idp == "local":
             return url_for("index")
+        if idp == "entra":
+            return url_for("entra_login")
         return url_for("wecom_login") if idp == "wecom" else url_for("pingone_login")
 
     def ensure_token(sess: UserSession) -> str:
@@ -198,15 +225,15 @@ def create_app(cfg: Config | None = None) -> Flask:
             except ScutumError as e:
                 sess.log("token_exchange", idp="local", result=e.error, detail=e.description)
                 raise ExchangeFailed(e) from e
-        if sess.idp == "pingone" and sess.pingone_access_token and time.time() < sess.pingone_expires_at - 30:
+        if sess.idp in ("pingone", "entra") and sess.pingone_access_token and time.time() < sess.pingone_expires_at - 30:
             try:
                 sess.scutum = scutum_token_for(sess)
-                sess.log("token_exchange", idp="pingone", result="ok", mode=exchange_mode(sess), reason="re-exchange")
+                sess.log("token_exchange", idp=sess.idp, result="ok", mode=exchange_mode(sess), reason="re-exchange")
                 return sess.scutum.access_token
             except IdpExchangeError as e:
                 raise ExchangeFailed(e) from e
             except ScutumError as e:
-                sess.log("token_exchange", idp="pingone", result=e.error, detail=e.description)
+                sess.log("token_exchange", idp=sess.idp, result=e.error, detail=e.description)
                 raise ExchangeFailed(e) from e
         # PingOne token 也过期了 / 企微 code 一次性：只能再走一次登录（企微内静默；PingOne 有 SSO 会话时同样无感）
         raise LoginRequired(login_url_for(sess.idp), "lyra token expired")
@@ -276,17 +303,20 @@ def create_app(cfg: Config | None = None) -> Flask:
         sess = current()
         if not sess:
             return redirect(url_for("index"))
-        two_stage = cfg.idp_exchange_enabled
+        two_stage = cfg.idp_exchange_enabled or sess.idp == "entra"
         tokens = {
             "IdP id_token": _claims(sess.pingone_id_token),
             ("IdP 登录 access_token（签给客户应用）" if two_stage else "PingOne access_token（签给 Scutum）"):
                 _claims(sess.pingone_access_token),
-            "IdP 交换出的 token（签给 Scutum）": _claims(sess.idp_exchanged_token),
+            ("Entra OBO 换出的 token（签给 Scutum）" if sess.idp == "entra" else "IdP 交换出的 token（签给 Scutum）"):
+                _claims(sess.idp_exchanged_token),
             "Scutum access_token（签给 Lyra）": _claims(sess.scutum.access_token if sess.scutum else None),
         }
         checks = []
         if sess.idp == "local":
             checks = _assertion_checks(sess, cfg)
+        elif sess.idp == "entra":
+            checks = _entra_checks(sess, cfg)
         elif sess.idp == "pingone":
             checks = _two_stage_checks(sess, cfg) if two_stage else _pingone_checks(sess)
         return render_template("debug.html", cfg=cfg, user=sess, tokens={k: v for k, v in tokens.items() if v},
@@ -516,7 +546,7 @@ def create_app(cfg: Config | None = None) -> Flask:
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "pingone": cfg.pingone_enabled, "wecom": cfg.wecom_enabled}
+        return {"ok": True, "pingone": cfg.pingone_enabled, "entra": cfg.entra_enabled, "wecom": cfg.wecom_enabled}
 
     # ------------------------------------------------------------------ PingOne
 
@@ -543,6 +573,44 @@ def create_app(cfg: Config | None = None) -> Flask:
             return redirect(url_for("index", error=f"PingOne 登录失败：{e}"))
         session["sid"] = store.put(sess)
         return redirect(url_for("chat"))
+
+    # ------------------------------------------------------------------ Microsoft Entra ID（登录 + OBO）
+
+    @app.get("/auth/entra/login")
+    def entra_login():
+        if not cfg.entra_enabled:
+            abort(404)
+        verifier, challenge = pkce_pair()
+        state, nonce = secrets.token_urlsafe(16), secrets.token_urlsafe(16)
+        session["entra"] = {"state": state, "nonce": nonce, "verifier": verifier}
+        return redirect(entra().authorization_url(state=state, nonce=nonce, code_challenge=challenge))
+
+    @app.get("/auth/entra/callback")
+    def entra_callback():
+        pending = session.pop("entra", None)
+        if request.args.get("error"):
+            return redirect(url_for("index", error=f"Entra: {request.args.get('error_description') or request.args['error']}"))
+        if not pending or request.args.get("state") != pending["state"]:
+            return redirect(url_for("index", error="Entra 回调 state 不匹配，请重新登录"))
+        try:
+            sess = complete_pingone_login(entra(), request.args.get("code", ""), pending["verifier"], pending["nonce"],
+                                          idp="entra")
+        except (PingOneError, jwt.PyJWTError, KeyError) as e:
+            logger.warning("Entra login failed: %s", e)
+            return redirect(url_for("index", error=f"Entra 登录失败：{e}"))
+        session["sid"] = store.put(sess)
+        return redirect(url_for("chat"))
+
+    @app.get("/auth/entra/logout")
+    def entra_logout():
+        """切换账号：清本应用会话，再去 Entra 登出（post_logout_redirect_uri 需登记在应用的回调地址里才会跳回）。"""
+        sess = current()
+        id_token = sess.pingone_id_token if sess and sess.idp == "entra" else None
+        store.drop(session.pop("sid", None))
+        if not cfg.entra_enabled:
+            return redirect(url_for("index"))
+        return redirect(entra().logout_url(id_token_hint=id_token, post_logout_redirect_uri=f"{cfg.app_base_url}/",
+                                           state=secrets.token_urlsafe(8)))
 
     # ------------------------------------------------------------------ 企业微信
 
@@ -686,6 +754,25 @@ def _two_stage_checks(sess: UserSession, cfg: Config) -> list[tuple[bool, str]]:
         (xt.get("client_id") == cfg.idp_exchange_client_id,
          f"交换出的 token client_id 是交换专用 client（实际：{xt.get('client_id')}）——Scutum 按它绑定应用"),
         (bool(xt.get("email")), "交换出的 token 带 email——否则检查 Processor Policy 和交换上下文的映射"),
+    ]
+
+
+def _entra_checks(sess: UserSession, cfg: Config) -> list[tuple[bool, str]]:
+    """Entra OBO 自检：登录 token 要签给本应用（OBO 前提）；OBO 换出的 token 要签给 Scutum API 应用、v2、带 a2a.invoke。"""
+    at, ot = _claims(sess.pingone_access_token), _claims(sess.idp_exchanged_token)
+    scps = set(str(ot.get("scp", "")).split())
+    obo_api = cfg.entra_obo_scope.rsplit("/", 1)[0].removeprefix("api://")
+    return [
+        (at.get("aud") in (cfg.entra_client_id, f"api://{cfg.entra_client_id}"),
+         f"登录 access_token 签给本应用（实际 aud={at.get('aud')}）——否则登录 scope 要带 api://<本应用>/access_as_user，"
+         "签给 Microsoft Graph 的 token 不能做 OBO"),
+        (bool(ot), "OBO 成功——失败原因（AADSTS…）见下方事件"),
+        (str(ot.get("iss", "")).endswith("/v2.0"),
+         f"OBO token 是 v2（iss={ot.get('iss')}）——否则在 Scutum API 应用的清单设 requestedAccessTokenVersion=2"),
+        (ot.get("aud") == obo_api, f"OBO token aud 是 Scutum API 应用的 client id（实际：{ot.get('aud')}）——与 Scutum 身份源的「令牌受众」一致"),
+        (ot.get("azp") == cfg.entra_client_id, f"OBO token azp 是本应用（实际：{ot.get('azp')}）——Scutum 按它绑定集成应用"),
+        ("a2a.invoke" in scps, f"OBO token scp 含 a2a.invoke（实际：{' '.join(sorted(scps)) or '无'}）"),
+        (bool(ot.get("preferred_username")), f"OBO token 带 preferred_username（{ot.get('preferred_username')}），Scutum 按它匹配 CRM 用户"),
     ]
 
 

@@ -8,10 +8,13 @@
     {% if cfg.pingone_enabled %}
     <a class="btn primary js-login" href="{{ url_for('pingone_login') }}" data-busy="正在跳转 PingOne…">使用 PingOne 登录</a>
     {% endif %}
+    {% if cfg.entra_enabled %}
+    <a class="btn{% if not cfg.pingone_enabled %} primary{% endif %} js-login" href="{{ url_for('entra_login') }}" data-busy="正在跳转 Microsoft…">使用 Microsoft Entra ID 登录</a>
+    {% endif %}
     {% if cfg.wecom_enabled %}
     <a class="btn js-login" href="{{ url_for('wecom_login') }}" data-busy="正在跳转企业微信…">使用企业微信登录</a>
     {% endif %}
-    {% if not cfg.pingone_enabled and not cfg.wecom_enabled and not cfg.local_login_enabled %}
+    {% if not cfg.pingone_enabled and not cfg.entra_enabled and not cfg.wecom_enabled and not cfg.local_login_enabled %}
     <div class="alert">未配置任何登录方式：请在 .env 中配置 PINGONE_*、WECOM_* 或 LOCAL_USERS_FILE，以及对应的 Scutum client。</div>
     {% endif %}
   </div>
