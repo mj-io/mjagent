@@ -732,7 +732,7 @@ def create_app(cfg: Config | None = None) -> Flask:
         if not sess:
             return jsonify(error="login_required", login_url=url_for("index")), 401
         try:
-            agents = _client(sess).list_agents()
+            agents = _client(sess).list_agents(cfg.lyra_agents)
         except (LoginRequired, ExchangeFailed, A2AError) as e:
             sess.log("a2a", call="list_agents", result=type(e).__name__, detail=str(e))
             return _api_error(e)
@@ -754,7 +754,8 @@ def create_app(cfg: Config | None = None) -> Flask:
         if not sess:
             return jsonify(error="login_required", login_url=url_for("index")), 401
         body = request.get_json(silent=True) or {}
-        agent, text = body.get("agent") or "crm_bot", (body.get("text") or "").strip()
+        agent = body.get("agent") or (cfg.lyra_agents[0] if cfg.lyra_agents else "crm_bot")
+        text = (body.get("text") or "").strip()
         if not text:
             return jsonify(error="empty_message"), 400
         if body.get("new_conversation"):

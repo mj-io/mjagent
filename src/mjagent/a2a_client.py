@@ -1,8 +1,10 @@
 """Lyra A2A 调用（JSON-RPC over HTTP，A2A 1.0），带 Scutum Bearer token。
 
-- GET  {lyra}/a2a/agents                              当前用户可用的 agent 列表（Lyra 扩展端点）
-- GET  {lyra}/a2a/{agent}/.well-known/agent-card.json  Agent Card（需认证，含 securitySchemes）
+调的是 Lyra 的对外端点（A2A_PUBLIC_BASE_URL 域名，ORI-158433）：
+- GET  {lyra}/a2a/{agent}/.well-known/agent-card.json  公开 Agent Card（匿名可取，含 securitySchemes）
 - POST {lyra}/a2a/{agent}/jsonrpc  SendStreamingMessage → SSE，每条 data 是一个 JSON-RPC 响应
+{agent} 是客户开放的 agent 实现路径（如 ask-event）。对外端点没有列表接口，可用 agent 由配置给出；
+未配置时回落旧的对内列表接口 GET {lyra}/a2a/agents。
 多轮对话：把首轮响应里的 contextId 带回下一条消息。
 """
 
@@ -48,11 +50,21 @@ class A2AClient:
                 detail = resp.text
             raise A2AError(resp.status_code, str(detail)[:500], resp.headers.get("www-authenticate"))
 
-    def list_agents(self) -> list[dict]:
-        with self._http() as c:
-            resp = c.get(self._url("/a2a/agents"))
-        self._raise(resp)
-        return resp.json().get("agents", [])
+    def list_agents(self, agents: tuple[str, ...] = ()) -> list[dict]:
+        """可用 agent：给了对外 agent 路径就逐个取公开卡（取不到的跳过），否则调对内列表接口。"""
+        if not agents:
+            with self._http() as c:
+                resp = c.get(self._url("/a2a/agents"))
+            self._raise(resp)
+            return resp.json().get("agents", [])
+        out = []
+        for key in agents:
+            try:
+                card = self.agent_card(key)
+            except A2AError:
+                continue
+            out.append({"key": key, "name": card.get("name") or key, "description": card.get("description") or ""})
+        return out
 
     def agent_card(self, agent: str) -> dict:
         with self._http() as c:

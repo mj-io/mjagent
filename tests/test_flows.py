@@ -24,6 +24,7 @@ from mjagent.scutum_client import TT_ACCESS_TOKEN, TT_WECOM_CODE, ScutumClient, 
 ISS = "https://auth.pingone.test/env-1/as"
 SCUTUM = "https://scutum.test"
 LYRA = "https://lyra.test/lyra"
+EXT = "https://agents.test"          # Lyra 对外域名（A2A_PUBLIC_BASE_URL）
 RESOURCE = "https://lyra.test/lyra/a2a"
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 JWK = {**json.loads(RSAAlgorithm.to_jwk(KEY.public_key())), "kid": "k1", "alg": "RS256", "use": "sig"}
@@ -84,7 +85,9 @@ class World:
             if not req.headers.get("authorization", "").startswith("Bearer lyra-token-for-"):
                 return httpx.Response(401, json={"detail": "Unauthorized"}, headers={"WWW-Authenticate": 'Bearer realm="lyra-a2a"'})
             return httpx.Response(200, json={"agents": [{"key": "crm_bot", "name": "CRM Bot"}]})
-        if url == f"{LYRA}/a2a/crm_bot/jsonrpc":
+        if url == f"{EXT}/a2a/ask-event/.well-known/agent-card.json":   # 对外公开卡：匿名可取
+            return httpx.Response(200, json={"name": "Chat (Event)", "description": "events"})
+        if url in (f"{LYRA}/a2a/crm_bot/jsonrpc", f"{EXT}/a2a/ask-event/jsonrpc"):
             ev1 = {"jsonrpc": "2.0", "id": "1", "result": {"statusUpdate": {"contextId": "ctx-9", "status": {"state": "TASK_STATE_WORKING"}}}}
             ev2 = {"jsonrpc": "2.0", "id": "1", "result": {"statusUpdate": {"contextId": "ctx-9", "status": {
                 "state": "TASK_STATE_COMPLETED", "message": {"parts": [{"text": "你好"}]}}}}}
@@ -385,3 +388,18 @@ def test_pingone_logout_clears_sso(client, world):
     assert r.status_code == 302 and r.headers["Location"].startswith(f"{ISS}/signoff?")
     assert q["post_logout_redirect_uri"] == ["https://mjagent.test/"] and q["id_token_hint"][0].count(".") == 2 and q["state"]
     assert client.get("/api/agents").status_code == 401       # 本应用会话已清
+
+
+def test_external_agents_listed_from_public_cards(world):
+    """配了 LYRA_AGENTS：agent 列表来自对外公开卡（不调对内 /a2a/agents），对话默认发给第一个对外 agent。"""
+    import dataclasses
+    cfg = dataclasses.replace(CFG, lyra_base_url=EXT, lyra_resource=EXT, lyra_agents=("ask-event", "missing"))
+    app = create_app(cfg)
+    app.config["TESTING"] = True
+    c = app.test_client()
+    _pingone_login(c, world)
+    r = c.get("/api/agents")
+    assert r.status_code == 200 and r.json["agents"] == [{"key": "ask-event", "name": "Chat (Event)", "description": "events"}]
+    assert not any(str(x.url).endswith("/a2a/agents") for x in world.calls)
+    body = c.post("/api/chat", json={"text": "hi"}).get_data(as_text=True)
+    assert "你好" in body and any(str(x.url) == f"{EXT}/a2a/ask-event/jsonrpc" for x in world.calls)

@@ -51,7 +51,7 @@
 
 ```bash
 S=https://scutum-auth-login.crmdev.veevasfa.com; H="X-Admin-Token: $SCUTUM_ADMIN_TOKEN"
-LYRA_RESOURCE=https://wchat-auth-login.crmdev.veevasfa.com/lyra/a2a
+LYRA_RESOURCE=https://auth-login001.crmdev.veevasfa.com   # Lyra 对外域名（A2A_PUBLIC_BASE_URL）
 
 # PingOne 作为受信 subject token 签发方
 curl -sX POST $S/admin/idps -H "$H" -H 'Content-Type: application/json' -d '{
@@ -76,19 +76,20 @@ curl -sX POST $S/admin/clients -H "$H" -H 'Content-Type: application/json' -d '{
   "exchange_idp":"wecom-mjagent","crm_match_field":"wecom_user_id","default_resource":"'$LYRA_RESOURCE'","scope":"a2a:invoke"}'
 ```
 
-Scutum 环境变量：`SCUTUM_OAUTH_RESOURCES={"<LYRA_RESOURCE>":"lyra"}`（lyra 资源应用须已存在于 `auth_apps`）。
+Scutum 环境变量：`SCUTUM_LYRA_A2A_BASE_URL=<LYRA_RESOURCE>`（A2A 资源路径为根 `/`，完整地址即该域名，也就是令牌 aud）。
 
 ### 4. Lyra（Veeva 侧，`.env`）
 
 ```
-A2A_AUTH_ENABLED=true
-A2A_AUTH_SCUTUM_BASE_URL=http://127.0.0.1:8001                 # 拉 JWKS，可走内网
+A2A_PUBLIC_BASE_URL=https://auth-login001.crmdev.veevasfa.com   # 对外域名 = 令牌 aud，整个域名反代到 lyra 根路径
+A2A_AUTH_SCUTUM_BASE_URL=http://127.0.0.1:8001                 # 拉 JWKS、调 access-check，可走内网
 A2A_AUTH_SCUTUM_PUBLIC_URL=https://scutum-auth-login.crmdev.veevasfa.com
 A2A_AUTH_ISSUER=<与 SCUTUM_JWT_ISSUER 相同>
-A2A_AUTH_RESOURCE_URL=https://wchat-auth-login.crmdev.veevasfa.com/lyra/a2a
-A2A_AUTH_RESOURCE_APPID=<Scutum auth_apps 中 lyra 的 appid>
-A2A_AUTH_PRM_URL=https://wchat-auth-login.crmdev.veevasfa.com/lyra/.well-known/oauth-protected-resource
 ```
+
+Scutum Bearer 只在对外端点生效（对内 `/a2a/{assistant_type}` 只认 CRM 会话）。对外开放哪些 agent 由客户在
+`ai_exposed_agents` 里配置（产品侧还需 `ai_agent_implements.a2a_exposable`），路径 = 实现名下划线换连字符，
+mjagent 用 `LYRA_AGENTS=ask-event` 指定。
 
 ### 5. mjagent
 

@@ -51,9 +51,12 @@ class Config:
     scutum_wecom_client_secret: str
 
     # ---- Lyra A2A ----
-    lyra_base_url: str                  # /a2a/agents 等相对路径的前缀，如 https://host/lyra
-    lyra_resource: str                  # RFC 8707 resource（= token aud），如 https://host/lyra/a2a
+    lyra_base_url: str                  # Lyra 对外 A2A 域名（A2A_PUBLIC_BASE_URL），如 https://agents.example.com
+    lyra_resource: str                  # RFC 8707 resource（= token aud），对外端点下就是同一个域名
     http_verify: bool = True
+    # 客户开放的对外 agent 路径（实现名下划线换连字符，如 ask-event），逗号分隔。对外端点没有列表接口，
+    # 按这里逐个取公开卡；为空时沿用旧的对内列表接口 /a2a/agents
+    lyra_agents: tuple[str, ...] = ()
 
     # ---- iframe 嵌入（ORI-159317 iframe 内外 PingOne 授权测试）----
     # 被嵌入方（agentx.mjio.cn）：开启 /embed/*，会话 cookie 改为 SameSite=None; Secure; Partitioned
@@ -155,6 +158,7 @@ def load_config() -> Config:
         scutum_wecom_client_secret=_env("SCUTUM_WECOM_CLIENT_SECRET"),
         lyra_base_url=_env("LYRA_BASE_URL").rstrip("/"),
         lyra_resource=_env("LYRA_RESOURCE").rstrip("/"),
+        lyra_agents=tuple(a.strip() for a in _env("LYRA_AGENTS").split(",") if a.strip()),
         http_verify=_bool("HTTP_VERIFY_TLS", True),
         embed_mode=_bool("EMBED_MODE", False),
         embed_frame_ancestors=_env("EMBED_FRAME_ANCESTORS"),
